@@ -1,2 +1,2 @@
-# EasyDNS
-DNS consumer w DoH DoT DNSSEC Cache
+# dnska
+lightweight dns client with DoH/DoT/DNSSEC and cache
