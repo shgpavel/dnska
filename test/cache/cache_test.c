@@ -96,6 +96,55 @@ make_a_response(uint8_t *buf, uint16_t id, uint16_t rcode, const char *qname,
 	return pos;
 }
 
+/*
+ * Build a response with two A records with different TTLs; used to
+ * verify the cache stores the minimum TTL.
+ */
+static size_t
+make_a_response_two_ttl(uint8_t *buf, uint16_t id, const char *qname,
+                        uint32_t ttl1, uint32_t ttl2)
+{
+	memset(buf, 0, DNS_HEADER_SIZE);
+	write_u16(buf, id);
+	write_u16(buf + 2, DNS_FLAG_QR | DNS_FLAG_RD | DNS_FLAG_RA);
+	write_u16(buf + 4, 1);
+	write_u16(buf + 6, 2);
+
+	size_t pos = DNS_HEADER_SIZE;
+	pos        = append_name(buf, pos, qname);
+	write_u16(buf + pos, DNS_TYPE_A);
+	write_u16(buf + pos + 2, DNS_CLASS_IN);
+	pos += 4;
+
+	/* First RR */
+	buf[pos++] = 0xC0;
+	buf[pos++] = DNS_HEADER_SIZE;
+	write_u16(buf + pos, DNS_TYPE_A);
+	write_u16(buf + pos + 2, DNS_CLASS_IN);
+	write_u32(buf + pos + 4, ttl1);
+	write_u16(buf + pos + 8, 4);
+	pos        += 10;
+	buf[pos++]  = 1;
+	buf[pos++]  = 2;
+	buf[pos++]  = 3;
+	buf[pos++]  = 4;
+
+	/* Second RR */
+	buf[pos++] = 0xC0;
+	buf[pos++] = DNS_HEADER_SIZE;
+	write_u16(buf + pos, DNS_TYPE_A);
+	write_u16(buf + pos + 2, DNS_CLASS_IN);
+	write_u32(buf + pos + 4, ttl2);
+	write_u16(buf + pos + 8, 4);
+	pos        += 10;
+	buf[pos++]  = 5;
+	buf[pos++]  = 6;
+	buf[pos++]  = 7;
+	buf[pos++]  = 8;
+
+	return pos;
+}
+
 static size_t
 make_nxdomain_response(uint8_t *buf, uint16_t id, const char *qname,
                        uint32_t soa_ttl, uint32_t minimum_ttl)
@@ -132,7 +181,8 @@ make_nxdomain_response(uint8_t *buf, uint16_t id, const char *qname,
 }
 
 static size_t
-make_nxdomain_without_soa_response(uint8_t *buf, uint16_t id, const char *qname)
+make_nxdomain_without_soa_response(uint8_t *buf, uint16_t id,
+                                   const char *qname)
 {
 	memset(buf, 0, DNS_HEADER_SIZE);
 	write_u16(buf, id);
@@ -147,6 +197,8 @@ make_nxdomain_without_soa_response(uint8_t *buf, uint16_t id, const char *qname)
 	return pos + 4;
 }
 
+/* Return the TTL of the first non-OPT RR in the answer, authority, or
+ * additional section.  Asserts if no such RR is found. */
 static uint32_t
 first_rr_ttl(const uint8_t *buf, size_t len)
 {
@@ -163,6 +215,8 @@ first_rr_ttl(const uint8_t *buf, size_t len)
 	return wire_read_u32(buf + pos + 4);
 }
 
+/* --- negative TTL handling --- */
+
 static void
 test_negative_ttl_cap(void)
 {
@@ -177,14 +231,17 @@ test_negative_ttl_cap(void)
 
 	assert(cache_init(&cache) == 0);
 
-	response_len = make_nxdomain_response(response, 0x1111, "example.com", 3600, 60);
-	query_len    = make_query(query, 0x2222, "example.com", DNS_TYPE_A, DNS_CLASS_IN);
+	response_len = make_nxdomain_response(response, 0x1111, "example.com",
+	                                      3600, 60);
+	query_len    = make_query(query, 0x2222, "example.com",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
 
 	cache_insert(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
 	             &key, response, response_len, 0);
 	assert(cache_lookup(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
 	                    &key, 0x3333,
-	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    query + DNS_HEADER_SIZE,
+	                    query_len - DNS_HEADER_SIZE,
 	                    out, sizeof(out), &out_len)
 	       == 1);
 	assert(wire_read_u16(out) == 0x3333);
@@ -209,13 +266,15 @@ test_servfail_ttl_override_cap(void)
 
 	response_len = make_a_response(response, 0x4444, DNS_RCODE_SERVFAIL,
 	                               "example.com", 300);
-	query_len    = make_query(query, 0x5555, "example.com", DNS_TYPE_A, DNS_CLASS_IN);
+	query_len    = make_query(query, 0x5555, "example.com",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
 
 	cache_insert(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
 	             &key, response, response_len, 5);
 	assert(cache_lookup(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
 	                    &key, 0x6666,
-	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    query + DNS_HEADER_SIZE,
+	                    query_len - DNS_HEADER_SIZE,
 	                    out, sizeof(out), &out_len)
 	       == 1);
 	assert(wire_read_u16(out) == 0x6666);
@@ -223,6 +282,39 @@ test_servfail_ttl_override_cap(void)
 
 	cache_destroy(&cache);
 }
+
+static void
+test_nxdomain_without_soa_uses_floor_ttl(void)
+{
+	struct cache               cache;
+	struct dns_query_cache_key key = { 0 };
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     response_len;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	response_len = make_nxdomain_without_soa_response(response, 0xAAAA,
+	                                                  "missing.example");
+	query_len    = make_query(query, 0xBBBB, "missing.example",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	cache_insert(&cache, "missing.example", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key, response, response_len, 0);
+	assert(cache_lookup(&cache, "missing.example", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key, 0xCCCC,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 1);
+	assert(wire_read_u16(out) == 0xCCCC);
+
+	cache_destroy(&cache);
+}
+
+/* --- question-bytes rewriting --- */
 
 static void
 test_cached_response_uses_current_question_bytes(void)
@@ -259,36 +351,7 @@ test_cached_response_uses_current_question_bytes(void)
 	cache_destroy(&cache);
 }
 
-static void
-test_nxdomain_without_soa_uses_floor_ttl(void)
-{
-	struct cache               cache;
-	struct dns_query_cache_key key = { 0 };
-	uint8_t                    response[DNS_MAX_MSG_SIZE];
-	uint8_t                    query[DNS_MAX_MSG_SIZE];
-	uint8_t                    out[DNS_MAX_MSG_SIZE];
-	size_t                     response_len;
-	size_t                     query_len;
-	size_t                     out_len = 0;
-
-	assert(cache_init(&cache) == 0);
-
-	response_len = make_nxdomain_without_soa_response(response, 0xAAAA,
-	                                                  "missing.example");
-	query_len    = make_query(query, 0xBBBB, "missing.example",
-	                          DNS_TYPE_A, DNS_CLASS_IN);
-
-	cache_insert(&cache, "missing.example", DNS_TYPE_A, DNS_CLASS_IN,
-	             &key, response, response_len, 0);
-	assert(cache_lookup(&cache, "missing.example", DNS_TYPE_A, DNS_CLASS_IN,
-	                    &key, 0xCCCC,
-	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
-	                    out, sizeof(out), &out_len)
-	       == 1);
-	assert(wire_read_u16(out) == 0xCCCC);
-
-	cache_destroy(&cache);
-}
+/* --- LRU ordering --- */
 
 static void
 test_lookup_promotes_entry_to_lru_head(void)
@@ -338,14 +401,257 @@ test_lookup_promotes_entry_to_lru_head(void)
 	cache_destroy(&cache);
 }
 
+/* --- miss behavior --- */
+
+static void
+test_miss_on_empty_cache(void)
+{
+	struct cache               cache;
+	struct dns_query_cache_key key = { 0 };
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	query_len = make_query(query, 0x1234, "example.com",
+	                       DNS_TYPE_A, DNS_CLASS_IN);
+	assert(cache_lookup(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key, 0x1234,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 0);
+
+	cache_destroy(&cache);
+}
+
+static void
+test_miss_different_qtype(void)
+{
+	/* Insert A, lookup AAAA → miss */
+	struct cache               cache;
+	struct dns_query_cache_key key = { 0 };
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     response_len;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	response_len = make_a_response(response, 0x1111, DNS_RCODE_OK,
+	                               "example.com", 300);
+	query_len    = make_query(query, 0x2222, "example.com",
+	                          DNS_TYPE_AAAA, DNS_CLASS_IN);
+
+	cache_insert(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key, response, response_len, 0);
+	assert(cache_lookup(&cache, "example.com", DNS_TYPE_AAAA, DNS_CLASS_IN,
+	                    &key, 0x3333,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 0);
+
+	cache_destroy(&cache);
+}
+
+static void
+test_miss_different_name(void)
+{
+	struct cache               cache;
+	struct dns_query_cache_key key = { 0 };
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     response_len;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	response_len = make_a_response(response, 0x1111, DNS_RCODE_OK,
+	                               "alpha.example", 300);
+	query_len    = make_query(query, 0x2222, "beta.example",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	cache_insert(&cache, "alpha.example", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key, response, response_len, 0);
+	assert(cache_lookup(&cache, "beta.example", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key, 0x3333,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 0);
+
+	cache_destroy(&cache);
+}
+
+static void
+test_lookup_case_insensitive_name(void)
+{
+	/* Insert with lowercase name, lookup with uppercase → still a hit */
+	struct cache               cache;
+	struct dns_query_cache_key key = { 0 };
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     response_len;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	response_len = make_a_response(response, 0x1111, DNS_RCODE_OK,
+	                               "example.com", 300);
+	query_len    = make_query(query, 0x2222, "EXAMPLE.COM",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	cache_insert(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key, response, response_len, 0);
+	assert(cache_lookup(&cache, "EXAMPLE.COM", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key, 0x3333,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 1);
+
+	cache_destroy(&cache);
+}
+
+/* --- cache key differentiation --- */
+
+static void
+test_cd_flag_differentiates_cache_entries(void)
+{
+	/* Same name/type/class but CD flag differs → independent entries */
+	struct cache               cache;
+	struct dns_query_cache_key key_cd    = { .flags = DNS_FLAG_CD | DNS_FLAG_RD };
+	struct dns_query_cache_key key_no_cd = { .flags = DNS_FLAG_RD };
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     response_len;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	response_len = make_a_response(response, 0x1111, DNS_RCODE_OK,
+	                               "example.com", 60);
+	query_len    = make_query(query, 0x2222, "example.com",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	cache_insert(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key_cd, response, response_len, 0);
+
+	/* Lookup with no-CD key → miss */
+	assert(cache_lookup(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key_no_cd, 0x3333,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 0);
+
+	/* Lookup with CD key → hit */
+	assert(cache_lookup(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key_cd, 0x4444,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 1);
+
+	cache_destroy(&cache);
+}
+
+static void
+test_overwrite_same_key(void)
+{
+	/* Insert same key twice; the second response should be returned */
+	struct cache               cache;
+	struct dns_query_cache_key key = { 0 };
+	uint8_t                    resp1[DNS_MAX_MSG_SIZE];
+	uint8_t                    resp2[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     len1;
+	size_t                     len2;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	len1      = make_a_response(resp1, 0x1111, DNS_RCODE_OK, "example.com",
+	                            100);
+	len2      = make_a_response(resp2, 0x2222, DNS_RCODE_OK, "example.com",
+	                            200);
+	query_len = make_query(query, 0x3333, "example.com",
+	                       DNS_TYPE_A, DNS_CLASS_IN);
+
+	cache_insert(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key, resp1, len1, 0);
+	cache_insert(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key, resp2, len2, 0);
+
+	assert(cache_lookup(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key, 0x3333,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 1);
+	/* TTL should come from resp2 (200), not resp1 (100) */
+	assert(first_rr_ttl(out, out_len) == 200);
+
+	cache_destroy(&cache);
+}
+
+static void
+test_min_ttl_used_from_multi_rr_response(void)
+{
+	/* Response with two RRs: TTL 300 and TTL 120 → cache lifetime is 120 */
+	struct cache               cache;
+	struct dns_query_cache_key key = { 0 };
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     response_len;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	response_len = make_a_response_two_ttl(response, 0x1111, "example.com",
+	                                       300, 120);
+	query_len    = make_query(query, 0x2222, "example.com",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	cache_insert(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key, response, response_len, 0);
+	assert(cache_lookup(&cache, "example.com", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key, 0x3333,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 1);
+	/* Both RR TTLs should be clamped to 120 in the hit */
+	assert(first_rr_ttl(out, out_len) == 120);
+
+	cache_destroy(&cache);
+}
+
 int
 main(void)
 {
 	test_negative_ttl_cap();
 	test_servfail_ttl_override_cap();
-	test_cached_response_uses_current_question_bytes();
 	test_nxdomain_without_soa_uses_floor_ttl();
+	test_cached_response_uses_current_question_bytes();
 	test_lookup_promotes_entry_to_lru_head();
+
+	test_miss_on_empty_cache();
+	test_miss_different_qtype();
+	test_miss_different_name();
+	test_lookup_case_insensitive_name();
+
+	test_cd_flag_differentiates_cache_entries();
+	test_overwrite_same_key();
+	test_min_ttl_used_from_multi_rr_response();
+
 	puts("cache tests passed");
 	return 0;
 }

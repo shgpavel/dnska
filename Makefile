@@ -41,6 +41,16 @@ $(TESTOBJDIR)/resolver_test: $(TESTDIR)/resolver/resolver_test.c $(SRCDIR)/resol
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/resolver/resolver_test.c $(SRCDIR)/resolver.c $(SRCDIR)/random.c
 
+$(TESTOBJDIR)/server_test: $(TESTDIR)/server/server_test.c \
+    $(SRCDIR)/server.c $(SRCDIR)/cache.c $(SRCDIR)/config.c \
+    $(SRCDIR)/dns.c $(SRCDIR)/random.c $(SRCDIR)/resolver.c \
+    $(SRCDIR)/wire.c $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/server/server_test.c \
+	    $(SRCDIR)/server.c $(SRCDIR)/cache.c $(SRCDIR)/config.c \
+	    $(SRCDIR)/dns.c $(SRCDIR)/random.c $(SRCDIR)/resolver.c \
+	    $(SRCDIR)/wire.c
+
 clean:
 	rm -rf $(OBJDIR)
 

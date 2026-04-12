@@ -114,6 +114,8 @@ struct dns_message {
 	size_t                     question_wire_len;
 	struct dns_query_cache_key cache_key;
 	bool                       cacheable;
+	bool                       has_edns;
+	uint8_t                    edns_version;
 };
 
 int

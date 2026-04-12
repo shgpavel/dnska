@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -86,6 +87,59 @@ make_error_response(const uint8_t *query, size_t query_len, size_t qd_wire_len,
 	return resp_len;
 }
 
+/*
+ * Build a BADVERS response (RFC 6891 §6.1.3).  BADVERS is extended
+ * rcode 16: low 4 bits in the DNS header are 0, high 8 bits (= 1) go
+ * in the OPT record's TTL field.  An OPT record MUST be included.
+ */
+static size_t
+make_badvers_response(const uint8_t *query, size_t query_len,
+                      size_t   qd_wire_len,
+                      uint8_t *resp, size_t resp_size)
+{
+	/* OPT wire: 1 (root) + 2 (type) + 2 (udp) + 4 (ttl) + 2 (rdlen) */
+	enum { OPT_WIRE_LEN = 11 };
+
+	size_t resp_len = DNS_HEADER_SIZE + qd_wire_len + OPT_WIRE_LEN;
+	if (query_len < DNS_HEADER_SIZE || resp_len > resp_size)
+		return 0;
+
+	resp[0]    = query[0];
+	resp[1]    = query[1];
+
+	uint8_t rd = query[2] & 0x01;
+	resp[2]    = 0x80 | rd; /* QR=1, opcode=0 */
+	resp[3]    = 0x80;      /* RA=1, rcode=0 (low nibble of 16 = 0) */
+
+	resp[4]    = 0;
+	resp[5]    = qd_wire_len > 0 ? 1 : 0;
+	resp[6]    = 0;
+	resp[7]    = 0;
+	resp[8]    = 0;
+	resp[9]    = 0;
+	resp[10]   = 0;
+	resp[11]   = 1; /* ARCOUNT = 1 (OPT) */
+
+	if (qd_wire_len > 0)
+		memcpy(resp + DNS_HEADER_SIZE, query + DNS_HEADER_SIZE,
+		       qd_wire_len);
+
+	size_t p  = DNS_HEADER_SIZE + qd_wire_len;
+	resp[p++] = 0x00; /* root name */
+	resp[p++] = 0x00; /* TYPE OPT high */
+	resp[p++] = 0x29; /* TYPE OPT low (41) */
+	resp[p++] = 0x04; /* UDP payload size high (1232) */
+	resp[p++] = 0xD0; /* UDP payload size low */
+	resp[p++] = 0x01; /* extended RCODE high byte = 1 (BADVERS=16) */
+	resp[p++] = 0x00; /* EDNS version = 0 */
+	resp[p++] = 0x00; /* flags high (DO=0) */
+	resp[p++] = 0x00; /* flags low */
+	resp[p++] = 0x00; /* RDLEN high */
+	resp[p++] = 0x00; /* RDLEN low */
+
+	return p;
+}
+
 static void
 write_u16(uint8_t *p, uint16_t v)
 {
@@ -101,8 +155,8 @@ source_addr_to_v6(const struct sockaddr_storage *addr, struct in6_addr *out)
 	if (addr->ss_family == AF_INET) {
 		const struct sockaddr_in *a4 = (const struct sockaddr_in *)addr;
 
-		out->s6_addr[10] = 0xFF;
-		out->s6_addr[11] = 0xFF;
+		out->s6_addr[10]             = 0xFF;
+		out->s6_addr[11]             = 0xFF;
 		memcpy(&out->s6_addr[12], &a4->sin_addr, sizeof(a4->sin_addr));
 		return true;
 	}
@@ -110,7 +164,7 @@ source_addr_to_v6(const struct sockaddr_storage *addr, struct in6_addr *out)
 	if (addr->ss_family == AF_INET6) {
 		const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)addr;
 
-		*out = a6->sin6_addr;
+		*out                          = a6->sin6_addr;
 		return true;
 	}
 
@@ -163,7 +217,8 @@ client_udp_payload_limit(const struct dns_query_cache_key *key)
 }
 
 static size_t
-truncate_response_for_client(uint8_t *response, size_t response_len, size_t payload_limit)
+truncate_response_for_client(uint8_t *response, size_t response_len,
+                             size_t payload_limit)
 {
 	size_t   limit = payload_limit;
 	size_t   pos   = DNS_HEADER_SIZE;
@@ -201,14 +256,16 @@ truncate_response_for_client(uint8_t *response, size_t response_len, size_t payl
 
 		for (uint16_t i = 0; i < section_counts[section]; i++) {
 			size_t next_offset;
-			if (skip_rr(response, response_len, truncated_len, &next_offset) < 0) {
+			if (skip_rr(response, response_len, truncated_len,
+			            &next_offset)
+			    < 0) {
 				section_counts[section] = included;
-				truncated = true;
+				truncated               = true;
 				goto finish;
 			}
 			if (next_offset > limit) {
 				section_counts[section] = included;
-				truncated = true;
+				truncated               = true;
 				goto finish;
 			}
 			truncated_len = next_offset;
@@ -240,7 +297,7 @@ header_only:
 
 static bool
 source_addr_matches(const struct source_limit_entry *entry,
-                    const struct sockaddr_storage *addr)
+                    const struct sockaddr_storage   *addr)
 {
 	struct in6_addr candidate;
 
@@ -253,21 +310,21 @@ source_addr_matches(const struct source_limit_entry *entry,
 }
 
 static void
-store_source_addr(struct source_limit_entry *entry,
+store_source_addr(struct source_limit_entry     *entry,
                   const struct sockaddr_storage *addr)
 {
 	entry->in_use = source_addr_to_v6(addr, &entry->addr6);
 }
 
 static int
-acquire_source_slot_locked(struct server *srv,
+acquire_source_slot_locked(struct server                 *srv,
                            const struct sockaddr_storage *addr)
 {
 	uint32_t hash      = source_hash(addr, srv->source_hash_seed);
 	int      free_slot = -1;
 
 	for (int i = 0; i < SOURCE_LIMIT_SLOTS; i++) {
-		int idx = (int)((hash + (uint32_t)i) % SOURCE_LIMIT_SLOTS);
+		int                        idx   = (int)((hash + (uint32_t)i) % SOURCE_LIMIT_SLOTS);
 		struct source_limit_entry *entry = &srv->source_limits[idx];
 
 		if (source_addr_matches(entry, addr)) {
@@ -309,6 +366,10 @@ release_source_slot_locked(struct server *srv, int source_slot)
 static void
 release_task_slot(struct query_task *task)
 {
+	if (task->conn_fd >= 0) {
+		close(task->conn_fd);
+		task->conn_fd = -1;
+	}
 	pthread_mutex_lock(&task->srv->task_lock);
 	release_source_slot_locked(task->srv, task->source_slot);
 	assert(task->srv->free_task_top < MAX_CONCURRENT_QUERIES);
@@ -316,6 +377,37 @@ release_task_slot(struct query_task *task)
 	pthread_mutex_unlock(&task->srv->task_lock);
 	task->source_slot = -1;
 	sem_post(&task->srv->query_sem);
+}
+
+static int
+send_tcp_response(int fd, const uint8_t *response, size_t response_len)
+{
+	uint8_t prefix[2];
+	size_t  sent = 0;
+
+	prefix[0]    = (uint8_t)(response_len >> 8);
+	prefix[1]    = (uint8_t)response_len;
+
+	while (sent < 2) {
+		ssize_t n = write(fd, prefix + sent, 2 - sent);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		sent += (size_t)n;
+	}
+	sent = 0;
+	while (sent < response_len) {
+		ssize_t n = write(fd, response + sent, response_len - sent);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		sent += (size_t)n;
+	}
+	return 0;
 }
 
 static void *
@@ -332,19 +424,72 @@ handle_query(void *arg)
 
 	if (dns_parse_message(&msg, task->query, task->query_len) < 0) {
 		uint8_t response[DNS_MAX_MSG_SIZE];
+		size_t  qd_wire_len  = question_wire_len_or_zero(task->query, task->query_len);
 		size_t  response_len = make_error_response(task->query, task->query_len,
-		                                           question_wire_len_or_zero(task->query, task->query_len),
-		                                           DNS_RCODE_FORMERR,
+		                                           qd_wire_len, DNS_RCODE_FORMERR,
 		                                           response, sizeof(response));
 
 		fprintf(stderr, "server: failed to parse query from %s:%d\n",
 		        addr_buf, port);
 		if (response_len > 0) {
-			ssize_t sent = sendto(task->sock_fd, response, response_len, 0,
-			                      (struct sockaddr *)&task->client_addr,
-			                      task->addr_len);
-			if (sent < 0)
-				fprintf(stderr, "server: sendto: %s\n", strerror(errno));
+			if (task->conn_fd >= 0) {
+				send_tcp_response(task->conn_fd, response,
+				                  response_len);
+			} else {
+				sendto(task->sock_fd, response, response_len, 0,
+				       (struct sockaddr *)&task->client_addr,
+				       task->addr_len);
+			}
+		}
+		release_task_slot(task);
+		return NULL;
+	}
+
+	/* RFC 1035: return NOTIMP for opcodes we do not handle */
+	uint8_t opcode = (uint8_t)((msg.header.flags & DNS_FLAGS_OPCODE_MASK)
+	                           >> DNS_FLAGS_OPCODE_SHIFT);
+	if (opcode != DNS_OPCODE_QUERY) {
+		uint8_t response[DNS_MAX_MSG_SIZE];
+		size_t  response_len = make_error_response(task->query, task->query_len,
+		                                           msg.question_wire_len,
+		                                           DNS_RCODE_NOTIMP,
+		                                           response, sizeof(response));
+
+		fprintf(stderr, "server: opcode %u from %s:%d -> NOTIMP\n",
+		        opcode, addr_buf, port);
+		if (response_len > 0) {
+			if (task->conn_fd >= 0) {
+				send_tcp_response(task->conn_fd, response,
+				                  response_len);
+			} else {
+				sendto(task->sock_fd, response, response_len, 0,
+				       (struct sockaddr *)&task->client_addr,
+				       task->addr_len);
+			}
+		}
+		release_task_slot(task);
+		return NULL;
+	}
+
+	/* RFC 6891 §6.1.3: reject EDNS version > 0 with BADVERS */
+	if (msg.has_edns && msg.edns_version > 0) {
+		uint8_t response[DNS_MAX_MSG_SIZE];
+		size_t  response_len = make_badvers_response(task->query, task->query_len,
+		                                             msg.question_wire_len,
+		                                             response, sizeof(response));
+
+		fprintf(stderr,
+		        "server: EDNS version %u from %s:%d -> BADVERS\n",
+		        msg.edns_version, addr_buf, port);
+		if (response_len > 0) {
+			if (task->conn_fd >= 0) {
+				send_tcp_response(task->conn_fd, response,
+				                  response_len);
+			} else {
+				sendto(task->sock_fd, response, response_len, 0,
+				       (struct sockaddr *)&task->client_addr,
+				       task->addr_len);
+			}
 		}
 		release_task_slot(task);
 		return NULL;
@@ -358,7 +503,6 @@ handle_query(void *arg)
 	uint8_t  response[DNS_MAX_MSG_SIZE];
 	size_t   response_len = 0;
 	uint16_t query_id     = msg.header.id;
-
 	int      hit          = 0;
 
 	if (msg.cacheable)
@@ -374,15 +518,19 @@ handle_query(void *arg)
 	if (hit == -2)
 		fprintf(stderr, "cache: expired %s %s\n",
 		        msg.question.name,
-		        dns_type_str(msg.question.qtype, qtype_buf, sizeof(qtype_buf)));
+		        dns_type_str(msg.question.qtype, qtype_buf,
+		                     sizeof(qtype_buf)));
 	if (hit == -1)
-		fprintf(stderr, "cache: failed to build cached response for %s %s\n",
+		fprintf(stderr,
+		        "cache: failed to build cached response for %s %s\n",
 		        msg.question.name,
-		        dns_type_str(msg.question.qtype, qtype_buf, sizeof(qtype_buf)));
+		        dns_type_str(msg.question.qtype, qtype_buf,
+		                     sizeof(qtype_buf)));
 	if (hit == 1) {
 		fprintf(stderr, "cache: hit %s %s (%zu bytes)\n",
 		        msg.question.name,
-		        dns_type_str(msg.question.qtype, qtype_buf, sizeof(qtype_buf)),
+		        dns_type_str(msg.question.qtype, qtype_buf,
+		                     sizeof(qtype_buf)),
 		        response_len);
 	} else {
 		int rc = resolver_forward(task->srv->config.upstream_addr,
@@ -392,14 +540,16 @@ handle_query(void *arg)
 		                          &response_len);
 
 		if (rc < 0) {
-			fprintf(stderr, "server: upstream failed for %s, "
-			                "sending SERVFAIL\n",
+			fprintf(stderr,
+			        "server: upstream failed for %s, "
+			        "sending SERVFAIL\n",
 			        msg.question.name);
 
-			response_len = make_error_response(task->query, task->query_len,
-			                                   msg.question_wire_len,
-			                                   DNS_RCODE_SERVFAIL,
-			                                   response, sizeof(response));
+			response_len = make_error_response(
+			        task->query, task->query_len,
+			        msg.question_wire_len,
+			        DNS_RCODE_SERVFAIL,
+			        response, sizeof(response));
 			if (response_len == 0) {
 				release_task_slot(task);
 				return NULL;
@@ -408,53 +558,75 @@ handle_query(void *arg)
 			uint16_t rcode = response_len >= 4 ? (response[3] & DNS_FLAGS_RCODE_MASK) : 0;
 			fprintf(stderr, "reply: %s %s -> %s (%zu bytes)\n",
 			        msg.question.name,
-			        dns_type_str(msg.question.qtype, qtype_buf, sizeof(qtype_buf)),
-			        dns_rcode_str(rcode, rcode_buf, sizeof(rcode_buf)),
+			        dns_type_str(msg.question.qtype, qtype_buf,
+			                     sizeof(qtype_buf)),
+			        dns_rcode_str(rcode, rcode_buf,
+			                      sizeof(rcode_buf)),
 			        response_len);
 
-			uint16_t flags = wire_read_u16(response + 2);
+			uint16_t flags     = wire_read_u16(response + 2);
 			uint32_t cache_ttl = (rcode == DNS_RCODE_SERVFAIL) ? CACHE_SERVFAIL_TTL : 0;
+
 			if (msg.cacheable
 			    && (flags & DNS_FLAG_TC) == 0
-			    && (rcode == DNS_RCODE_OK || rcode == DNS_RCODE_NXDOMAIN || rcode == DNS_RCODE_SERVFAIL)) {
-				if (!dns_response_matches_query(&msg, response, response_len)) {
+			    && (rcode == DNS_RCODE_OK
+			        || rcode == DNS_RCODE_NXDOMAIN
+			        || rcode == DNS_RCODE_SERVFAIL)) {
+				if (!dns_response_matches_query(&msg, response,
+				                                response_len)) {
 					fprintf(stderr,
-					        "cache: reject upstream reply for %s %s "
-					        "(question mismatch or malformed response)\n",
+					        "cache: reject upstream reply "
+					        "for %s %s (question mismatch "
+					        "or malformed response)\n",
 					        msg.question.name,
-					        dns_type_str(msg.question.qtype, qtype_buf, sizeof(qtype_buf)));
+					        dns_type_str(msg.question.qtype,
+					                     qtype_buf,
+					                     sizeof(qtype_buf)));
 				} else {
 					cache_insert(&task->srv->cache,
 					             msg.question.name,
 					             msg.question.qtype,
 					             msg.question.qclass,
 					             &msg.cache_key,
-					             response, response_len, cache_ttl);
+					             response, response_len,
+					             cache_ttl);
 				}
 			} else if ((flags & DNS_FLAG_TC) != 0) {
 				fprintf(stderr,
-				        "cache: skip truncated response for %s %s\n",
+				        "cache: skip truncated response for "
+				        "%s %s\n",
 				        msg.question.name,
-				        dns_type_str(msg.question.qtype, qtype_buf, sizeof(qtype_buf)));
+				        dns_type_str(msg.question.qtype,
+				                     qtype_buf, sizeof(qtype_buf)));
 			}
 		}
 	}
 
-	size_t client_limit = client_udp_payload_limit(&msg.cache_key);
-	if (response_len > client_limit) {
-		size_t truncated_len = truncate_response_for_client(response, response_len,
-		                                                    client_limit);
-		if (truncated_len == 0) {
-			release_task_slot(task);
-			return NULL;
+	/* For TCP clients, the full response is always usable; for UDP,
+	 * respect the client's advertised payload limit. */
+	if (task->conn_fd < 0) {
+		size_t client_limit = client_udp_payload_limit(&msg.cache_key);
+		if (response_len > client_limit) {
+			size_t truncated_len = truncate_response_for_client(response, response_len,
+			                                                    client_limit);
+			if (truncated_len == 0) {
+				release_task_slot(task);
+				return NULL;
+			}
+			response_len = truncated_len;
 		}
-		response_len = truncated_len;
 	}
 
-	ssize_t sent = sendto(task->sock_fd, response, response_len, 0,
-	                      (struct sockaddr *)&task->client_addr, task->addr_len);
-	if (sent < 0) {
-		fprintf(stderr, "server: sendto: %s\n", strerror(errno));
+	if (task->conn_fd >= 0) {
+		if (send_tcp_response(task->conn_fd, response, response_len) < 0)
+			fprintf(stderr, "server: TCP write: %s\n",
+			        strerror(errno));
+	} else {
+		ssize_t sent = sendto(task->sock_fd, response, response_len, 0,
+		                      (struct sockaddr *)&task->client_addr,
+		                      task->addr_len);
+		if (sent < 0)
+			fprintf(stderr, "server: sendto: %s\n", strerror(errno));
 	}
 
 	release_task_slot(task);
@@ -515,15 +687,175 @@ bind_udp(int family, int port)
 	return fd;
 }
 
+static int
+bind_tcp(int family, int port)
+{
+	int fd = socket(family, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+
+	int optval = 1;
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+	               &optval, sizeof(optval))
+	    < 0) {
+		close(fd);
+		return -1;
+	}
+
+	if (family == AF_INET6) {
+		if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+		               &optval, sizeof(optval))
+		    < 0) {
+			close(fd);
+			return -1;
+		}
+	}
+
+	struct sockaddr_storage addr;
+	socklen_t               addr_len;
+	memset(&addr, 0, sizeof(addr));
+
+	if (family == AF_INET) {
+		struct sockaddr_in *a4 = (struct sockaddr_in *)&addr;
+		a4->sin_family         = AF_INET;
+		a4->sin_port           = htons(port);
+		a4->sin_addr.s_addr    = INADDR_ANY;
+		addr_len               = sizeof(*a4);
+	} else {
+		struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&addr;
+		a6->sin6_family         = AF_INET6;
+		a6->sin6_port           = htons(port);
+		a6->sin6_addr           = in6addr_any;
+		addr_len                = sizeof(*a6);
+	}
+
+	if (bind(fd, (struct sockaddr *)&addr, addr_len) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	if (listen(fd, 32) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	return fd;
+}
+
+/*
+ * Accept a TCP connection, read the 2-byte length-prefixed DNS message
+ * (RFC 1035 §4.2.2), and dispatch it to the thread pool.  Blocks
+ * briefly while reading; closes the connection on any error.
+ */
+static void
+accept_and_dispatch_tcp(struct server *srv, int listen_fd)
+{
+	struct sockaddr_storage client_addr;
+	socklen_t               addr_len = sizeof(client_addr);
+
+	int                     conn_fd  = accept(listen_fd, (struct sockaddr *)&client_addr,
+	                                          &addr_len);
+	if (conn_fd < 0) {
+		if (errno != EINTR && errno != ECONNABORTED)
+			fprintf(stderr, "server: accept: %s\n", strerror(errno));
+		return;
+	}
+
+	/* Short read timeout to avoid blocking the accept thread */
+	struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+	if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO,
+	               &tv, sizeof(tv))
+	    < 0) {
+		close(conn_fd);
+		return;
+	}
+
+	/* Read 2-byte message length (RFC 1035 §4.2.2) */
+	uint8_t len_buf[2];
+	ssize_t n = recv(conn_fd, len_buf, 2, MSG_WAITALL);
+	if (n != 2) {
+		close(conn_fd);
+		return;
+	}
+	uint16_t msg_size = (uint16_t)(((uint16_t)len_buf[0] << 8) | len_buf[1]);
+	if (msg_size < DNS_HEADER_SIZE || msg_size > DNS_MAX_MSG_SIZE) {
+		close(conn_fd);
+		return;
+	}
+
+	uint8_t query[DNS_MAX_MSG_SIZE];
+	n = recv(conn_fd, query, msg_size, MSG_WAITALL);
+	if (n != (ssize_t)msg_size) {
+		close(conn_fd);
+		return;
+	}
+
+	if (sem_trywait(&srv->query_sem) != 0) {
+		fprintf(stderr, "server: at capacity, dropping TCP query\n");
+		close(conn_fd);
+		return;
+	}
+
+	pthread_mutex_lock(&srv->task_lock);
+	int source_slot = acquire_source_slot_locked(srv, &client_addr);
+	if (source_slot < 0) {
+		pthread_mutex_unlock(&srv->task_lock);
+		sem_post(&srv->query_sem);
+		fprintf(stderr,
+		        "server: TCP source concurrency limit exceeded\n");
+		close(conn_fd);
+		return;
+	}
+
+	assert(srv->free_task_top > 0);
+	if (srv->free_task_top == 0) {
+		release_source_slot_locked(srv, source_slot);
+		pthread_mutex_unlock(&srv->task_lock);
+		sem_post(&srv->query_sem);
+		close(conn_fd);
+		return;
+	}
+
+	int slot = srv->free_task_slots[--srv->free_task_top];
+	pthread_mutex_unlock(&srv->task_lock);
+
+	struct query_task *task = &srv->query_tasks[slot];
+	task->srv               = srv;
+	task->slot              = slot;
+	task->source_slot       = source_slot;
+	task->sock_fd           = -1;
+	task->conn_fd           = conn_fd;
+	task->query_len         = msg_size;
+	task->addr_len          = addr_len;
+	memcpy(task->query, query, msg_size);
+	memcpy(&task->client_addr, &client_addr, sizeof(client_addr));
+
+	pthread_t      tid;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+	if (pthread_create(&tid, &attr, handle_query, task) != 0) {
+		fprintf(stderr, "server: pthread_create: %s\n", strerror(errno));
+		release_task_slot(task);
+	}
+
+	pthread_attr_destroy(&attr);
+}
+
 int
 server_init(struct server *srv, const struct dns_config *cfg)
 {
 	memset(srv, 0, sizeof(*srv));
 	srv->sock_fd  = -1;
 	srv->sock_fd6 = -1;
+	srv->tcp_fd   = -1;
+	srv->tcp_fd6  = -1;
 	srv->config   = *cfg;
 
-	if (random_bytes(&srv->source_hash_seed, sizeof(srv->source_hash_seed)) < 0) {
+	if (random_bytes(&srv->source_hash_seed,
+	                 sizeof(srv->source_hash_seed))
+	    < 0) {
 		fprintf(stderr, "server: failed to generate source hash seed\n");
 		return -1;
 	}
@@ -548,13 +880,14 @@ server_init(struct server *srv, const struct dns_config *cfg)
 
 	srv->free_task_top = MAX_CONCURRENT_QUERIES;
 	for (int i = 0; i < MAX_CONCURRENT_QUERIES; i++) {
-		srv->free_task_slots[i] = MAX_CONCURRENT_QUERIES - 1 - i;
+		srv->free_task_slots[i]         = MAX_CONCURRENT_QUERIES - 1 - i;
 		srv->query_tasks[i].source_slot = -1;
+		srv->query_tasks[i].conn_fd     = -1;
 	}
 
 	srv->sock_fd = bind_udp(AF_INET, srv->config.listen_port);
 	if (srv->sock_fd < 0) {
-		fprintf(stderr, "server: bind IPv4 port %d: %s\n",
+		fprintf(stderr, "server: bind IPv4 UDP port %d: %s\n",
 		        srv->config.listen_port, strerror(errno));
 		pthread_mutex_destroy(&srv->task_lock);
 		sem_destroy(&srv->query_sem);
@@ -564,18 +897,32 @@ server_init(struct server *srv, const struct dns_config *cfg)
 
 	srv->sock_fd6 = bind_udp(AF_INET6, srv->config.listen_port);
 	if (srv->sock_fd6 < 0) {
-		fprintf(stderr, "server: warning: IPv6 bind port %d failed: "
-		                "%s\n",
+		fprintf(stderr, "server: warning: IPv6 UDP bind port %d "
+		                "failed: %s\n",
 		        srv->config.listen_port, strerror(errno));
-		srv->sock_fd6 = -1;
+	}
+
+	srv->tcp_fd = bind_tcp(AF_INET, srv->config.listen_port);
+	if (srv->tcp_fd < 0) {
+		fprintf(stderr, "server: warning: IPv4 TCP bind port %d "
+		                "failed: %s\n",
+		        srv->config.listen_port, strerror(errno));
+	}
+
+	srv->tcp_fd6 = bind_tcp(AF_INET6, srv->config.listen_port);
+	if (srv->tcp_fd6 < 0) {
+		fprintf(stderr, "server: warning: IPv6 TCP bind port %d "
+		                "failed: %s\n",
+		        srv->config.listen_port, strerror(errno));
 	}
 
 	srv->running = 1;
-	fprintf(stderr, "server: listening on 0.0.0.0:%d, upstream %s:%d\n",
+	fprintf(stderr, "server: listening on 0.0.0.0:%d (UDP+TCP), "
+	                "upstream %s:%d\n",
 	        srv->config.listen_port, srv->config.upstream_addr,
 	        srv->config.upstream_port);
-	fprintf(stderr, "server: warning: no client ACL and only basic per-source limits; "
-	                "not safe for public exposure\n");
+	fprintf(stderr, "server: warning: no client ACL and only basic "
+	                "per-source limits; not safe for public exposure\n");
 
 	return 0;
 }
@@ -615,9 +962,9 @@ receive_and_dispatch(struct server *srv, int sock_fd)
 	}
 
 	/*
-	 * Once query_sem is acquired and a source slot is reserved, a task slot
-	 * must be available. The semaphore, source limiter, and task pool stay
-	 * aligned unless there is a logic bug elsewhere.
+	 * Once query_sem is acquired and a source slot is reserved, a task
+	 * slot must be available.  The semaphore, source limiter, and task
+	 * pool stay aligned unless there is a logic bug elsewhere.
 	 */
 	assert(srv->free_task_top > 0);
 	if (srv->free_task_top == 0) {
@@ -636,6 +983,7 @@ receive_and_dispatch(struct server *srv, int sock_fd)
 	task->slot              = slot;
 	task->source_slot       = source_slot;
 	task->sock_fd           = sock_fd;
+	task->conn_fd           = -1;
 	task->query_len         = (size_t)n;
 	task->addr_len          = addr_len;
 	memcpy(task->query, query, (size_t)n);
@@ -658,17 +1006,29 @@ int
 server_run(struct server *srv)
 {
 	while (srv->running) {
-		struct pollfd pfds[2];
-		nfds_t        nfds = 1;
+		struct pollfd pfds[4];
+		nfds_t        nfds = 0;
 
 		memset(pfds, 0, sizeof(pfds));
-		pfds[0].fd     = srv->sock_fd;
-		pfds[0].events = POLLIN;
+
+		pfds[nfds].fd     = srv->sock_fd;
+		pfds[nfds].events = POLLIN;
+		nfds++;
 
 		if (srv->sock_fd6 >= 0) {
-			pfds[1].fd     = srv->sock_fd6;
-			pfds[1].events = POLLIN;
-			nfds           = 2;
+			pfds[nfds].fd     = srv->sock_fd6;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
+		if (srv->tcp_fd >= 0) {
+			pfds[nfds].fd     = srv->tcp_fd;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
+		if (srv->tcp_fd6 >= 0) {
+			pfds[nfds].fd     = srv->tcp_fd6;
+			pfds[nfds].events = POLLIN;
+			nfds++;
 		}
 
 		int ret = poll(pfds, nfds, 1000);
@@ -682,11 +1042,16 @@ server_run(struct server *srv)
 		if (ret == 0)
 			continue;
 
-		if ((pfds[0].revents & POLLIN) != 0)
-			receive_and_dispatch(srv, srv->sock_fd);
-
-		if (nfds > 1 && (pfds[1].revents & POLLIN) != 0)
-			receive_and_dispatch(srv, srv->sock_fd6);
+		for (nfds_t i = 0; i < nfds; i++) {
+			if ((pfds[i].revents & POLLIN) == 0)
+				continue;
+			if (pfds[i].fd == srv->tcp_fd
+			    || pfds[i].fd == srv->tcp_fd6) {
+				accept_and_dispatch_tcp(srv, pfds[i].fd);
+			} else {
+				receive_and_dispatch(srv, pfds[i].fd);
+			}
+		}
 	}
 
 	return 0;
@@ -737,8 +1102,8 @@ server_stop(struct server *srv)
 	bool drained = drain_query_threads(srv);
 	if (!drained) {
 		fprintf(stderr, "server: warning: query threads did not drain "
-		                "within 10 seconds; process must exit immediately "
-		                "after shutdown\n");
+		                "within 10 seconds; process must exit "
+		                "immediately after shutdown\n");
 	}
 
 	if (srv->sock_fd >= 0) {
@@ -748,6 +1113,14 @@ server_stop(struct server *srv)
 	if (srv->sock_fd6 >= 0) {
 		close(srv->sock_fd6);
 		srv->sock_fd6 = -1;
+	}
+	if (srv->tcp_fd >= 0) {
+		close(srv->tcp_fd);
+		srv->tcp_fd = -1;
+	}
+	if (srv->tcp_fd6 >= 0) {
+		close(srv->tcp_fd6);
+		srv->tcp_fd6 = -1;
 	}
 	if (drained) {
 		pthread_mutex_destroy(&srv->task_lock);

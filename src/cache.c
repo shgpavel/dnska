@@ -608,6 +608,7 @@ cache_insert(struct cache *c, const char *name, uint16_t qtype, uint16_t qclass,
 		min_ttl = rrs_min_ttl(response, response_len);
 		if (min_ttl == 0)
 			return;
+		ttl_cap = min_ttl;
 	}
 
 	int             bucket = (int)(hash_key(c, name, qtype, qclass, query_key) % CACHE_BUCKETS);

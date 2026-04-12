@@ -34,7 +34,8 @@ struct query_task {
 	struct server          *srv;
 	int                     slot;
 	int                     source_slot;
-	int                     sock_fd;
+	int                     sock_fd; /* UDP: server bound socket */
+	int                     conn_fd; /* TCP: accepted connection, or -1 */
 	uint8_t                 query[DNS_MAX_MSG_SIZE];
 	size_t                  query_len;
 	struct sockaddr_storage client_addr;
@@ -42,18 +43,20 @@ struct query_task {
 };
 
 struct server {
-	struct dns_config     config;
-	int                   sock_fd;
-	int                   sock_fd6;
-	volatile sig_atomic_t running;
-	sem_t                 query_sem;
-	pthread_mutex_t       task_lock;
-	struct query_task     query_tasks[MAX_CONCURRENT_QUERIES];
-	int                   free_task_slots[MAX_CONCURRENT_QUERIES];
-	int                   free_task_top;
-	uint32_t              source_hash_seed;
+	struct dns_config         config;
+	int                       sock_fd;
+	int                       sock_fd6;
+	int                       tcp_fd;
+	int                       tcp_fd6;
+	volatile sig_atomic_t     running;
+	sem_t                     query_sem;
+	pthread_mutex_t           task_lock;
+	struct query_task         query_tasks[MAX_CONCURRENT_QUERIES];
+	int                       free_task_slots[MAX_CONCURRENT_QUERIES];
+	int                       free_task_top;
+	uint32_t                  source_hash_seed;
 	struct source_limit_entry source_limits[SOURCE_LIMIT_SLOTS];
-	struct cache          cache;
+	struct cache              cache;
 };
 
 int

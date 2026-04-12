@@ -56,9 +56,9 @@ static bool
 normalize_opt_for_cache(const uint8_t *rdata, uint16_t rdlen,
                         uint16_t *normalized_rdlen, uint64_t *normalized_hash)
 {
-	size_t   pos = 0;
+	size_t   pos      = 0;
 	uint16_t kept_len = 0;
-	uint64_t h = 1469598103934665603ULL;
+	uint64_t h        = 1469598103934665603ULL;
 
 	while (pos < rdlen) {
 		if (rdlen - pos < 4)
@@ -213,6 +213,12 @@ dns_parse_message(struct dns_message *msg, const uint8_t *buf, size_t len)
 
 		if (parse_rr_view(&rr, buf, len, offset) < 0)
 			return -1;
+
+		/* Extract EDNS info from first OPT, regardless of cacheability */
+		if (rr.type == DNS_TYPE_OPT && !msg->has_edns) {
+			msg->has_edns     = true;
+			msg->edns_version = (uint8_t)((rr.ttl >> 16) & 0xFF);
+		}
 
 		if (msg->cacheable) {
 			if (rr.type != DNS_TYPE_OPT || msg->cache_key.has_opt) {
