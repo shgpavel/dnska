@@ -223,7 +223,7 @@ ssl_writen(SSL *ssl, const uint8_t *buf, size_t len)
  */
 static int
 forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
-            int            family,
+            int family, const char *hostname,
             const uint8_t *query, size_t query_len,
             uint16_t upstream_id, const uint8_t *orig_query,
             uint8_t *response, size_t response_size,
@@ -267,6 +267,9 @@ forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
 		close(fd);
 		return -1;
 	}
+
+	if (hostname != NULL && hostname[0] != '\0')
+		SSL_set_tlsext_host_name(ssl, hostname);
 
 	if (SSL_connect(ssl) <= 0) {
 		fprintf(stderr, "resolver: TLS handshake failed: %s\n",
@@ -427,7 +430,7 @@ forward_tcp(const struct sockaddr *upstream, socklen_t upstream_len,
 
 int
 resolver_forward(const char *upstream_addr, uint16_t upstream_port,
-                 bool           upstream_tls,
+                 bool upstream_tls, const char *upstream_hostname,
                  const uint8_t *query, size_t query_len,
                  uint8_t *response, size_t response_size,
                  size_t *response_len)
@@ -485,6 +488,7 @@ resolver_forward(const char *upstream_addr, uint16_t upstream_port,
 	/* DoT: bypass UDP entirely and go directly to TLS */
 	if (upstream_tls)
 		return forward_tls((const struct sockaddr *)&ss, ss_len, family,
+		                   upstream_hostname,
 		                   forwarded_query, query_len,
 		                   upstream_id, query,
 		                   response, response_size, response_len);

@@ -15,7 +15,9 @@
 #include <unistd.h>
 
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #include "cache.h"
 #include "dns.h"
@@ -585,6 +587,7 @@ process_dns_query(struct query_task *task)
 		int rc = resolver_forward(task->srv->config.upstream_addr,
 		                          task->srv->config.upstream_port,
 		                          task->srv->config.upstream_tls,
+		                          task->srv->config.upstream_hostname,
 		                          task->query, task->query_len,
 		                          response, sizeof(response),
 		                          &response_len);
@@ -1014,6 +1017,48 @@ receive_and_dispatch(struct server *srv, int sock_fd)
 	              sock_fd, -1, NULL);
 }
 
+static int
+make_selfsigned_cert(SSL_CTX *ctx)
+{
+	EVP_PKEY *pkey = EVP_EC_gen("P-256");
+	if (pkey == NULL)
+		return -1;
+
+	X509 *cert = X509_new();
+	if (cert == NULL) {
+		EVP_PKEY_free(pkey);
+		return -1;
+	}
+
+	X509_NAME *name;
+	int        ok = X509_set_version(cert, 2) == 1
+	                && ASN1_INTEGER_set(X509_get_serialNumber(cert), 1) == 1
+	                && X509_gmtime_adj(X509_getm_notBefore(cert), 0) != NULL
+	                && X509_gmtime_adj(X509_getm_notAfter(cert),
+	                                   (long)30 * 365 * 24 * 60 * 60)
+	                           != NULL
+	                && X509_set_pubkey(cert, pkey) == 1;
+	if (!ok) {
+		X509_free(cert);
+		EVP_PKEY_free(pkey);
+		return -1;
+	}
+
+	name = X509_get_subject_name(cert);
+	ok   = X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+	                                   (const unsigned char *)"dnska",
+	                                   -1, -1, 0)
+	               == 1
+	       && X509_set_issuer_name(cert, name) == 1
+	       && X509_sign(cert, pkey, EVP_sha256()) > 0
+	       && SSL_CTX_use_certificate(ctx, cert) == 1
+	       && SSL_CTX_use_PrivateKey(ctx, pkey) == 1;
+
+	X509_free(cert);
+	EVP_PKEY_free(pkey);
+	return ok ? 0 : -1;
+}
+
 int
 server_init(struct server *srv, const struct dns_config *cfg)
 {
@@ -1063,76 +1108,99 @@ server_init(struct server *srv, const struct dns_config *cfg)
 		srv->query_tasks[i].tls         = NULL;
 	}
 
-	srv->sock_fd = bind_udp(AF_INET, srv->config.listen_port);
-	if (srv->sock_fd < 0) {
-		log_msg(LOG_ERROR, "server: bind IPv4 UDP port %d: %s\n",
-		        srv->config.listen_port, strerror(errno));
-		pthread_cond_destroy(&srv->work_cond);
-		pthread_mutex_destroy(&srv->task_lock);
-		cache_destroy(&srv->cache);
-		return -1;
-	}
-
-	srv->sock_fd6 = bind_udp(AF_INET6, srv->config.listen_port);
-	if (srv->sock_fd6 < 0) {
-		log_msg(LOG_WARN, "server: warning: IPv6 UDP bind port %d "
-		                  "failed: %s\n",
-		        srv->config.listen_port, strerror(errno));
-	}
-
-	srv->tcp_fd = bind_tcp(AF_INET, srv->config.listen_port);
-	if (srv->tcp_fd < 0) {
-		log_msg(LOG_WARN, "server: warning: IPv4 TCP bind port %d "
-		                  "failed: %s\n",
-		        srv->config.listen_port, strerror(errno));
-	}
-
-	srv->tcp_fd6 = bind_tcp(AF_INET6, srv->config.listen_port);
-	if (srv->tcp_fd6 < 0) {
-		log_msg(LOG_WARN, "server: warning: IPv6 TCP bind port %d "
-		                  "failed: %s\n",
-		        srv->config.listen_port, strerror(errno));
-	}
-
-	/* DoT listener (RFC 7858): requires cert and key paths */
-	if (cfg->dot_port > 0
-	    && cfg->tls_cert[0] != '\0'
-	    && cfg->tls_key[0] != '\0') {
+	if (cfg->upstream_tls) {
+		/* DoT listener (RFC 7858) */
 		SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
 		if (ctx == NULL) {
-			log_msg(LOG_ERROR,
-			        "server: DoT SSL_CTX_new failed\n");
-		} else {
-			SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-			if (SSL_CTX_use_certificate_file(ctx, cfg->tls_cert,
-			                                 SSL_FILETYPE_PEM)
-			            != 1
-			    || SSL_CTX_use_PrivateKey_file(ctx, cfg->tls_key,
-			                                   SSL_FILETYPE_PEM)
-			               != 1) {
+			log_msg(LOG_ERROR, "server: DoT SSL_CTX_new failed\n");
+			pthread_cond_destroy(&srv->work_cond);
+			pthread_mutex_destroy(&srv->task_lock);
+			cache_destroy(&srv->cache);
+			return -1;
+		}
+		SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+		int cert_ok;
+		if (cfg->tls_cert[0] != '\0' && cfg->tls_key[0] != '\0') {
+			cert_ok = SSL_CTX_use_certificate_file(
+			                  ctx, cfg->tls_cert,
+			                  SSL_FILETYPE_PEM)
+			                  == 1
+			          && SSL_CTX_use_PrivateKey_file(
+			                     ctx, cfg->tls_key,
+			                     SSL_FILETYPE_PEM)
+			                     == 1;
+			if (!cert_ok)
 				log_msg(LOG_ERROR,
 				        "server: DoT failed to load cert/key: "
 				        "cert=%s key=%s\n",
 				        cfg->tls_cert, cfg->tls_key);
-				SSL_CTX_free(ctx);
-			} else {
-				srv->tls_ctx = ctx;
-				srv->dot_fd  = bind_tcp(AF_INET,
-				                        cfg->dot_port);
-				if (srv->dot_fd < 0)
-					log_msg(LOG_WARN,
-					        "server: warning: IPv4 DoT bind "
-					        "port %d failed: %s\n",
-					        cfg->dot_port, strerror(errno));
-				srv->dot_fd6 = bind_tcp(AF_INET6,
-				                        cfg->dot_port);
-				if (srv->dot_fd6 < 0)
-					log_msg(LOG_WARN,
-					        "server: warning: IPv6 DoT bind "
-					        "port %d failed: %s\n",
-					        cfg->dot_port, strerror(errno));
-			}
+		} else {
+			cert_ok = make_selfsigned_cert(ctx) == 0;
+			if (!cert_ok)
+				log_msg(LOG_ERROR,
+				        "server: DoT failed to generate "
+				        "self-signed cert\n");
+			else
+				log_msg(LOG_INFO,
+				        "server: DoT using ephemeral "
+				        "self-signed cert\n");
 		}
+		if (!cert_ok) {
+			SSL_CTX_free(ctx);
+			pthread_cond_destroy(&srv->work_cond);
+			pthread_mutex_destroy(&srv->task_lock);
+			cache_destroy(&srv->cache);
+			return -1;
+		}
+		srv->tls_ctx = ctx;
+		srv->dot_fd  = bind_tcp(AF_INET, cfg->listen_port);
+		if (srv->dot_fd < 0) {
+			log_msg(LOG_ERROR,
+			        "server: bind IPv4 DoT port %d: %s\n",
+			        cfg->listen_port, strerror(errno));
+			SSL_CTX_free(ctx);
+			srv->tls_ctx = NULL;
+			pthread_cond_destroy(&srv->work_cond);
+			pthread_mutex_destroy(&srv->task_lock);
+			cache_destroy(&srv->cache);
+			return -1;
+		}
+		srv->dot_fd6 = bind_tcp(AF_INET6, cfg->listen_port);
+		if (srv->dot_fd6 < 0)
+			log_msg(LOG_WARN,
+			        "server: warning: IPv6 DoT bind port %d "
+			        "failed: %s\n",
+			        cfg->listen_port, strerror(errno));
+	} else {
+		/* Plain DNS listener (UDP + TCP, RFC 7766) */
+		srv->sock_fd = bind_udp(AF_INET, cfg->listen_port);
+		if (srv->sock_fd < 0) {
+			log_msg(LOG_ERROR,
+			        "server: bind IPv4 UDP port %d: %s\n",
+			        cfg->listen_port, strerror(errno));
+			pthread_cond_destroy(&srv->work_cond);
+			pthread_mutex_destroy(&srv->task_lock);
+			cache_destroy(&srv->cache);
+			return -1;
+		}
+		srv->sock_fd6 = bind_udp(AF_INET6, cfg->listen_port);
+		if (srv->sock_fd6 < 0)
+			log_msg(LOG_WARN,
+			        "server: warning: IPv6 UDP bind port %d "
+			        "failed: %s\n",
+			        cfg->listen_port, strerror(errno));
+		srv->tcp_fd = bind_tcp(AF_INET, cfg->listen_port);
+		if (srv->tcp_fd < 0)
+			log_msg(LOG_WARN,
+			        "server: warning: IPv4 TCP bind port %d "
+			        "failed: %s\n",
+			        cfg->listen_port, strerror(errno));
+		srv->tcp_fd6 = bind_tcp(AF_INET6, cfg->listen_port);
+		if (srv->tcp_fd6 < 0)
+			log_msg(LOG_WARN,
+			        "server: warning: IPv6 TCP bind port %d "
+			        "failed: %s\n",
+			        cfg->listen_port, strerror(errno));
 	}
 
 	/* Spawn the worker thread pool */
@@ -1173,15 +1241,13 @@ server_init(struct server *srv, const struct dns_config *cfg)
 	}
 
 	srv->running = 1;
-	log_msg(LOG_INFO, "server: listening on 0.0.0.0:%d (UDP+TCP), "
+	log_msg(LOG_INFO, "server: listening on 0.0.0.0:%d (%s), "
 	                  "upstream %s:%d%s\n",
-	        srv->config.listen_port, srv->config.upstream_addr,
+	        srv->config.listen_port,
+	        srv->config.upstream_tls ? "DoT" : "UDP+TCP",
+	        srv->config.upstream_addr,
 	        srv->config.upstream_port,
 	        srv->config.upstream_tls ? " (DoT)" : "");
-	if (srv->tls_ctx != NULL)
-		log_msg(LOG_INFO,
-		        "server: DoT listener on port %d\n",
-		        srv->config.dot_port);
 	log_msg(LOG_WARN, "server: warning: no client ACL and only basic "
 	                  "per-source limits; not safe for public exposure\n");
 

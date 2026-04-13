@@ -9,7 +9,7 @@
 
 int
 resolver_forward(const char *upstream_addr, uint16_t upstream_port,
-                 bool           upstream_tls,
+                 bool upstream_tls, const char *upstream_hostname,
                  const uint8_t *query, size_t query_len,
                  uint8_t *response, size_t response_size,
                  size_t *response_len);

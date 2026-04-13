@@ -169,7 +169,7 @@ test_id_randomized_flags_stripped(void)
 	                       DNS_FLAG_RD | DNS_FLAG_AD | DNS_FLAG_CD,
 	                       "example.com");
 	rc        = resolver_forward("127.0.0.1", ntohs(upstream_addr.sin_port),
-	                             false,
+	                             false, NULL,
 	                             query, query_len,
 	                             response, sizeof(response), &response_len);
 
@@ -267,7 +267,7 @@ test_0x20_randomization_uppercase_present(void)
 	/* "example.com" has 10 alphabetic bytes: P(all lower) = 1/1024 */
 	query_len = make_query(query, 0xABCD, DNS_FLAG_RD, "example.com");
 	resolver_forward("127.0.0.1", ntohs(upstream_addr.sin_port),
-	                 false,
+	                 false, NULL,
 	                 query, query_len,
 	                 response, sizeof(response), &response_len);
 
@@ -475,7 +475,7 @@ test_tcp_fallback_on_truncation(void)
 
 	query_len = make_query(query, 0x1234, DNS_FLAG_RD, "example.com");
 	rc        = resolver_forward("127.0.0.1", fx.port,
-	                             false,
+	                             false, NULL,
 	                             query, query_len,
 	                             response, sizeof(response), &response_len);
 

@@ -12,6 +12,9 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+
 #include "dns.h"
 #include "server.h"
 #include "wire.h"
@@ -139,6 +142,7 @@ struct test_server {
 	pthread_t     thread;
 	int           udp_port;
 	int           tcp_port;
+	int           dot_port;
 };
 
 static void *
@@ -177,6 +181,7 @@ start_test_server(struct test_server *ts, const char *upstream_addr,
 	memset(ts, 0, sizeof(*ts));
 	ts->udp_port = -1;
 	ts->tcp_port = -1;
+	ts->dot_port = -1;
 
 	if (server_init(&ts->srv, &cfg) < 0)
 		return -1;
@@ -922,6 +927,168 @@ test_tcp_no_truncation(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* DoT test helpers                                                     */
+/* ------------------------------------------------------------------ */
+
+static int
+start_dot_test_server(struct test_server *ts, const char *upstream_addr,
+                      int upstream_port)
+{
+	struct dns_config cfg;
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.listen_port   = 0; /* kernel assigns port */
+	cfg.upstream_port = (uint16_t)upstream_port;
+	cfg.upstream_tls  = true;
+	snprintf(cfg.upstream_addr, sizeof(cfg.upstream_addr),
+	         "%s", upstream_addr);
+
+	memset(ts, 0, sizeof(*ts));
+	ts->udp_port = -1;
+	ts->tcp_port = -1;
+	ts->dot_port = -1;
+
+	if (server_init(&ts->srv, &cfg) < 0)
+		return -1;
+
+	ts->dot_port = get_bound_port(ts->srv.dot_fd);
+	if (ts->dot_port < 0)
+		return -1;
+
+	if (pthread_create(&ts->thread, NULL, run_thread, &ts->srv) != 0)
+		return -1;
+
+	return 0;
+}
+
+/*
+ * Send a DoT query (TLS + 2-byte length prefix) and read the response.
+ * Uses opportunistic TLS — no certificate verification.
+ * Returns the DNS response length, or -1 on error.
+ */
+static ssize_t
+dot_roundtrip(int port, const uint8_t *query, size_t qlen,
+              uint8_t *resp, size_t resp_size)
+{
+	SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+	if (ctx == NULL)
+		return -1;
+	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		SSL_CTX_free(ctx);
+		return -1;
+	}
+
+	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+	struct sockaddr_in dst;
+	memset(&dst, 0, sizeof(dst));
+	dst.sin_family      = AF_INET;
+	dst.sin_port        = htons((uint16_t)port);
+	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	if (connect(fd, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+		close(fd);
+		SSL_CTX_free(ctx);
+		return -1;
+	}
+
+	SSL *ssl = SSL_new(ctx);
+	if (ssl == NULL || SSL_set_fd(ssl, fd) != 1) {
+		if (ssl != NULL)
+			SSL_free(ssl);
+		close(fd);
+		SSL_CTX_free(ctx);
+		return -1;
+	}
+
+	if (SSL_connect(ssl) <= 0) {
+		SSL_free(ssl);
+		close(fd);
+		SSL_CTX_free(ctx);
+		return -1;
+	}
+
+	uint8_t lenbuf[2] = { (uint8_t)(qlen >> 8), (uint8_t)qlen };
+	if (SSL_write(ssl, lenbuf, 2) != 2
+	    || SSL_write(ssl, query, (int)qlen) != (int)qlen) {
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+		close(fd);
+		SSL_CTX_free(ctx);
+		return -1;
+	}
+
+	if (SSL_read(ssl, lenbuf, 2) != 2) {
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+		close(fd);
+		SSL_CTX_free(ctx);
+		return -1;
+	}
+
+	uint16_t rlen = (uint16_t)((lenbuf[0] << 8) | lenbuf[1]);
+	if (rlen == 0 || rlen > (uint16_t)resp_size) {
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+		close(fd);
+		SSL_CTX_free(ctx);
+		return -1;
+	}
+
+	ssize_t got = 0;
+	while (got < (ssize_t)rlen) {
+		int n = SSL_read(ssl, resp + got, rlen - (int)got);
+		if (n <= 0)
+			break;
+		got += n;
+	}
+
+	SSL_shutdown(ssl);
+	SSL_free(ssl);
+	close(fd);
+	SSL_CTX_free(ctx);
+	return got;
+}
+
+/*
+ * DoT smoke test: verify that the server starts with an auto-generated
+ * self-signed cert, completes the TLS handshake, and returns a valid
+ * (SERVFAIL) response when the upstream is unreachable.
+ */
+static void
+test_dot_listener_autocert(void)
+{
+	struct test_server ts;
+
+	/* Port 1 — nothing will respond, so we get SERVFAIL */
+	TEST_CHECK(start_dot_test_server(&ts, "127.0.0.1", 1) == 0);
+
+	if (ts.dot_port < 0) {
+		stop_test_server(&ts);
+		TEST_SKIP("DoT socket not available");
+	}
+
+	uint8_t query[DNS_MAX_MSG_SIZE];
+	uint8_t resp[DNS_MAX_MSG_SIZE];
+	size_t  qlen = make_query(query, 0x5A5A, "example.com",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	ssize_t rlen = dot_roundtrip(ts.dot_port, query, qlen,
+	                             resp, sizeof(resp));
+	TEST_CHECK(rlen >= DNS_HEADER_SIZE);
+	TEST_CHECK(get_u16(resp) == 0x5A5A);
+	TEST_CHECK((get_u16(resp + 2) & DNS_FLAG_QR) != 0);
+	TEST_CHECK((get_u16(resp + 2) & DNS_FLAGS_RCODE_MASK)
+	           == DNS_RCODE_SERVFAIL);
+
+	stop_test_server(&ts);
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -938,6 +1105,7 @@ main(void)
 	test_tcp_badvers();
 	test_tcp_pipelining();
 	test_tcp_no_truncation();
+	test_dot_listener_autocert();
 
 	puts("server tests passed");
 	return 0;
