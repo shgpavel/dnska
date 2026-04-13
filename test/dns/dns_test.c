@@ -214,7 +214,7 @@ test_multi_question_query(void)
 	assert(msg.header.qdcount == 2);
 	assert(strcmp(msg.question.name, "example.com") == 0);
 	assert(msg.question.qtype == DNS_TYPE_A);
-	assert(!msg.cacheable);
+	assert(!dns_query_is_cacheable(&msg));
 }
 
 static void
@@ -287,7 +287,7 @@ test_non_query_opcode_not_cacheable(void)
 	pos += 4;
 
 	assert(dns_parse_message(&msg, buf, pos) == 0);
-	assert(!msg.cacheable);
+	assert(!dns_query_is_cacheable(&msg));
 }
 
 static void
@@ -318,7 +318,7 @@ test_query_with_answer_section_not_cacheable(void)
 	buf[pos++]  = 4;
 
 	assert(dns_parse_message(&msg, buf, pos) == 0);
-	assert(!msg.cacheable);
+	assert(!dns_query_is_cacheable(&msg));
 }
 
 static void
@@ -338,7 +338,7 @@ test_multiple_opt_records_not_cacheable(void)
 	pos = append_opt_record(buf, pos, 1232, 0, NULL, 0);
 
 	assert(dns_parse_message(&msg, buf, pos) == 0);
-	assert(!msg.cacheable);
+	assert(!dns_query_is_cacheable(&msg));
 }
 
 static void
@@ -361,7 +361,7 @@ test_opt_in_wrong_section(void)
 	pos += 10;
 
 	assert(dns_parse_message(&msg, buf, pos) == 0);
-	assert(!msg.cacheable);
+	assert(!dns_query_is_cacheable(&msg));
 }
 
 /* --- message parsing: EDNS --- */
@@ -385,7 +385,7 @@ test_edns_version_zero_sets_has_edns(void)
 	assert(dns_parse_message(&msg, buf, pos) == 0);
 	assert(msg.has_edns);
 	assert(msg.edns_version == 0);
-	assert(msg.cacheable);
+	assert(dns_query_is_cacheable(&msg));
 }
 
 static void
@@ -434,7 +434,7 @@ test_edns_version_extracted_even_when_not_cacheable(void)
 	pos = append_opt_record(buf, pos, 1232, 0x00010000UL, NULL, 0);
 
 	assert(dns_parse_message(&msg, buf, pos) == 0);
-	assert(!msg.cacheable);
+	assert(!dns_query_is_cacheable(&msg));
 	assert(msg.has_edns);
 	assert(msg.edns_version == 1);
 }
@@ -503,8 +503,8 @@ test_opt_cookie_ignored_in_cache_key(void)
 
 	assert(dns_parse_message(&msg_a, buf_a, pos_a) == 0);
 	assert(dns_parse_message(&msg_b, buf_b, pos_b) == 0);
-	assert(msg_a.cacheable);
-	assert(msg_b.cacheable);
+	assert(dns_query_is_cacheable(&msg_a));
+	assert(dns_query_is_cacheable(&msg_b));
 	assert(msg_a.cache_key.has_opt);
 	assert(msg_b.cache_key.has_opt);
 	assert(msg_a.cache_key.opt_rdlen == 0);
@@ -555,8 +555,8 @@ test_opt_non_cookie_data_affects_cache_key(void)
 
 	assert(dns_parse_message(&msg_a, buf_a, pos_a) == 0);
 	assert(dns_parse_message(&msg_b, buf_b, pos_b) == 0);
-	assert(msg_a.cacheable);
-	assert(msg_b.cacheable);
+	assert(dns_query_is_cacheable(&msg_a));
+	assert(dns_query_is_cacheable(&msg_b));
 	assert(msg_a.cache_key.opt_rdlen == sizeof(opt_a));
 	assert(msg_b.cache_key.opt_rdlen == sizeof(opt_b));
 	assert(msg_a.cache_key.opt_rdata_hash != 0);

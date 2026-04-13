@@ -183,11 +183,6 @@ dns_parse_message(struct dns_message *msg, const uint8_t *buf, size_t len)
 
 	msg->question_wire_len  = name_consumed + 4;
 	msg->cache_key.flags    = msg->header.flags & DNS_CACHE_FLAGS_MASK;
-	msg->cacheable          = ((msg->header.flags & DNS_FLAGS_OPCODE_MASK)
-	                           == (DNS_OPCODE_QUERY << DNS_FLAGS_OPCODE_SHIFT))
-	                          && msg->header.qdcount == 1
-	                          && msg->header.ancount == 0
-	                          && msg->header.nscount == 0;
 
 	offset                 += 4;
 
@@ -220,20 +215,18 @@ dns_parse_message(struct dns_message *msg, const uint8_t *buf, size_t len)
 			msg->edns_version = (uint8_t)((rr.ttl >> 16) & 0xFF);
 		}
 
-		if (msg->cacheable) {
-			if (rr.type != DNS_TYPE_OPT || msg->cache_key.has_opt) {
-				msg->cacheable = false;
+		if (rr.type != DNS_TYPE_OPT) {
+			msg->has_bad_additional = true;
+		} else if (msg->cache_key.has_opt) {
+			msg->has_bad_additional = true; /* second OPT */
+		} else {
+			uint16_t opt_rdlen = 0;
+			uint64_t opt_hash  = 0;
+
+			if (!normalize_opt_for_cache(buf + rr.rdata_offset, rr.rdlen,
+			                             &opt_rdlen, &opt_hash)) {
+				msg->has_bad_additional = true;
 			} else {
-				uint16_t opt_rdlen = 0;
-				uint64_t opt_hash  = 0;
-
-				if (!normalize_opt_for_cache(buf + rr.rdata_offset, rr.rdlen,
-				                             &opt_rdlen, &opt_hash)) {
-					msg->cacheable = false;
-					offset         = rr.next_offset;
-					continue;
-				}
-
 				msg->cache_key.has_opt        = 1;
 				msg->cache_key.opt_udp_size   = rr.rrclass;
 				msg->cache_key.opt_ttl        = rr.ttl;
@@ -249,6 +242,17 @@ dns_parse_message(struct dns_message *msg, const uint8_t *buf, size_t len)
 		return -1;
 
 	return 0;
+}
+
+bool
+dns_query_is_cacheable(const struct dns_message *msg)
+{
+	return ((msg->header.flags & DNS_FLAGS_OPCODE_MASK)
+	        == (DNS_OPCODE_QUERY << DNS_FLAGS_OPCODE_SHIFT))
+	       && msg->header.qdcount == 1
+	       && msg->header.ancount == 0
+	       && msg->header.nscount == 0
+	       && !msg->has_bad_additional;
 }
 
 bool

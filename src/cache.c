@@ -15,15 +15,6 @@
 #include "random.h"
 #include "wire.h"
 
-static void
-write_u32(uint8_t *p, uint32_t v)
-{
-	p[0] = (uint8_t)(v >> 24);
-	p[1] = (uint8_t)(v >> 16);
-	p[2] = (uint8_t)(v >> 8);
-	p[3] = (uint8_t)v;
-}
-
 static bool
 monotonic_now(struct timespec *ts)
 {
@@ -59,7 +50,6 @@ hash_key(const struct cache *c, const char *name, uint16_t qtype, uint16_t qclas
 	h = h * 33 ^ (uint32_t)qclass;
 	h = h * 33 ^ (uint32_t)query_key->flags;
 	h = h * 33 ^ (uint32_t)query_key->has_opt;
-	h = h * 33 ^ (uint32_t)query_key->opt_udp_size;
 	h = h * 33 ^ (uint32_t)query_key->opt_rdlen;
 	h = h * 33 ^ query_key->opt_ttl;
 	h = h * 33 ^ (uint32_t)query_key->opt_rdata_hash;
@@ -262,7 +252,7 @@ patch_ttls(uint8_t *buf, size_t buf_len, uint32_t elapsed, uint32_t ttl_cap)
 			if (cap_ttls && ttl > cap_left)
 				ttl = cap_left;
 
-			write_u32(buf + pos + 4, ttl);
+			wire_write_u32(buf + pos + 4, ttl);
 		}
 
 		pos += 10 + wire_read_u16(buf + pos + 8);
@@ -277,7 +267,6 @@ query_key_matches(const struct dns_query_cache_key *a,
 {
 	return a->flags == b->flags
 	       && a->has_opt == b->has_opt
-	       && a->opt_udp_size == b->opt_udp_size
 	       && a->opt_rdlen == b->opt_rdlen
 	       && a->opt_ttl == b->opt_ttl
 	       && a->opt_rdata_hash == b->opt_rdata_hash;

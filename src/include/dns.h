@@ -113,13 +113,15 @@ struct dns_message {
 	struct dns_question        question;
 	size_t                     question_wire_len;
 	struct dns_query_cache_key cache_key;
-	bool                       cacheable;
 	bool                       has_edns;
+	bool                       has_bad_additional; /* non-OPT or >1 OPT in AR */
 	uint8_t                    edns_version;
 };
 
 int
 dns_parse_message(struct dns_message *msg, const uint8_t *buf, size_t len);
+bool
+dns_query_is_cacheable(const struct dns_message *msg);
 int
 dns_parse_name(const uint8_t *buf, size_t buf_len, size_t offset,
                char *out, size_t out_size, size_t *bytes_consumed);

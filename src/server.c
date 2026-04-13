@@ -6,7 +6,6 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +16,7 @@
 
 #include "cache.h"
 #include "dns.h"
+#include "log.h"
 #include "random.h"
 #include "resolver.h"
 #include "server.h"
@@ -138,13 +138,6 @@ make_badvers_response(const uint8_t *query, size_t query_len,
 	resp[p++] = 0x00; /* RDLEN low */
 
 	return p;
-}
-
-static void
-write_u16(uint8_t *p, uint16_t v)
-{
-	p[0] = (uint8_t)(v >> 8);
-	p[1] = (uint8_t)v;
 }
 
 static bool
@@ -279,19 +272,19 @@ finish:
 	if (!truncated)
 		return response_len;
 
-	write_u16(response + 4, qdcount);
-	write_u16(response + 6, section_counts[0]);
-	write_u16(response + 8, section_counts[1]);
-	write_u16(response + 10, section_counts[2]);
-	write_u16(response + 2, wire_read_u16(response + 2) | DNS_FLAG_TC);
+	wire_write_u16(response + 4, qdcount);
+	wire_write_u16(response + 6, section_counts[0]);
+	wire_write_u16(response + 8, section_counts[1]);
+	wire_write_u16(response + 10, section_counts[2]);
+	wire_write_u16(response + 2, wire_read_u16(response + 2) | DNS_FLAG_TC);
 	return truncated_len;
 
 header_only:
-	write_u16(response + 4, 0);
-	write_u16(response + 6, 0);
-	write_u16(response + 8, 0);
-	write_u16(response + 10, 0);
-	write_u16(response + 2, wire_read_u16(response + 2) | DNS_FLAG_TC);
+	wire_write_u16(response + 4, 0);
+	wire_write_u16(response + 6, 0);
+	wire_write_u16(response + 8, 0);
+	wire_write_u16(response + 10, 0);
+	wire_write_u16(response + 2, wire_read_u16(response + 2) | DNS_FLAG_TC);
 	return DNS_HEADER_SIZE;
 }
 
@@ -376,7 +369,6 @@ release_task_slot(struct query_task *task)
 	task->srv->free_task_slots[task->srv->free_task_top++] = task->slot;
 	pthread_mutex_unlock(&task->srv->task_lock);
 	task->source_slot = -1;
-	sem_post(&task->srv->query_sem);
 }
 
 static int
@@ -410,26 +402,63 @@ send_tcp_response(int fd, const uint8_t *response, size_t response_len)
 	return 0;
 }
 
-static void *
-handle_query(void *arg)
+static void
+handle_query(struct query_task *task)
 {
-	struct query_task *task = arg;
 	struct dns_message msg;
 	char               addr_buf[INET6_ADDRSTRLEN];
 	char               qtype_buf[32];
 	char               rcode_buf[32];
 	uint16_t           port;
 
+	/* TCP: read the length-prefixed query from the connection (RFC 1035
+	 * §4.2.2).  Moved here so the poll loop is never blocked on I/O. */
+	if (task->conn_fd >= 0 && task->query_len == 0) {
+		uint8_t        len_buf[2];
+		struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+
+		if (setsockopt(task->conn_fd, SOL_SOCKET, SO_RCVTIMEO,
+		               &tv, sizeof(tv))
+		    < 0) {
+			release_task_slot(task);
+			return;
+		}
+
+		ssize_t n = recv(task->conn_fd, len_buf, 2, MSG_WAITALL);
+		if (n != 2) {
+			release_task_slot(task);
+			return;
+		}
+
+		uint16_t msg_size = (uint16_t)(((uint16_t)len_buf[0] << 8)
+		                               | len_buf[1]);
+		if (msg_size < DNS_HEADER_SIZE || msg_size > DNS_MAX_MSG_SIZE) {
+			release_task_slot(task);
+			return;
+		}
+
+		n = recv(task->conn_fd, task->query, msg_size, MSG_WAITALL);
+		if (n != (ssize_t)msg_size) {
+			release_task_slot(task);
+			return;
+		}
+		task->query_len = msg_size;
+	}
+
 	addr_str(&task->client_addr, addr_buf, sizeof(addr_buf), &port);
 
 	if (dns_parse_message(&msg, task->query, task->query_len) < 0) {
 		uint8_t response[DNS_MAX_MSG_SIZE];
-		size_t  qd_wire_len  = question_wire_len_or_zero(task->query, task->query_len);
-		size_t  response_len = make_error_response(task->query, task->query_len,
-		                                           qd_wire_len, DNS_RCODE_FORMERR,
-		                                           response, sizeof(response));
+		size_t  qd_wire_len  = question_wire_len_or_zero(task->query,
+		                                                 task->query_len);
+		size_t  response_len = make_error_response(task->query,
+		                                           task->query_len,
+		                                           qd_wire_len,
+		                                           DNS_RCODE_FORMERR,
+		                                           response,
+		                                           sizeof(response));
 
-		fprintf(stderr, "server: failed to parse query from %s:%d\n",
+		log_msg(LOG_WARN, "server: failed to parse query from %s:%d\n",
 		        addr_buf, port);
 		if (response_len > 0) {
 			if (task->conn_fd >= 0) {
@@ -442,7 +471,7 @@ handle_query(void *arg)
 			}
 		}
 		release_task_slot(task);
-		return NULL;
+		return;
 	}
 
 	/* RFC 1035: return NOTIMP for opcodes we do not handle */
@@ -450,12 +479,14 @@ handle_query(void *arg)
 	                           >> DNS_FLAGS_OPCODE_SHIFT);
 	if (opcode != DNS_OPCODE_QUERY) {
 		uint8_t response[DNS_MAX_MSG_SIZE];
-		size_t  response_len = make_error_response(task->query, task->query_len,
+		size_t  response_len = make_error_response(task->query,
+		                                           task->query_len,
 		                                           msg.question_wire_len,
 		                                           DNS_RCODE_NOTIMP,
-		                                           response, sizeof(response));
+		                                           response,
+		                                           sizeof(response));
 
-		fprintf(stderr, "server: opcode %u from %s:%d -> NOTIMP\n",
+		log_msg(LOG_WARN, "server: opcode %u from %s:%d -> NOTIMP\n",
 		        opcode, addr_buf, port);
 		if (response_len > 0) {
 			if (task->conn_fd >= 0) {
@@ -468,17 +499,19 @@ handle_query(void *arg)
 			}
 		}
 		release_task_slot(task);
-		return NULL;
+		return;
 	}
 
 	/* RFC 6891 §6.1.3: reject EDNS version > 0 with BADVERS */
 	if (msg.has_edns && msg.edns_version > 0) {
 		uint8_t response[DNS_MAX_MSG_SIZE];
-		size_t  response_len = make_badvers_response(task->query, task->query_len,
+		size_t  response_len = make_badvers_response(task->query,
+		                                             task->query_len,
 		                                             msg.question_wire_len,
-		                                             response, sizeof(response));
+		                                             response,
+		                                             sizeof(response));
 
-		fprintf(stderr,
+		log_msg(LOG_WARN,
 		        "server: EDNS version %u from %s:%d -> BADVERS\n",
 		        msg.edns_version, addr_buf, port);
 		if (response_len > 0) {
@@ -492,10 +525,10 @@ handle_query(void *arg)
 			}
 		}
 		release_task_slot(task);
-		return NULL;
+		return;
 	}
 
-	fprintf(stderr, "query: %s %s from %s:%d\n",
+	log_msg(LOG_INFO, "query: %s %s from %s:%d\n",
 	        msg.question.name,
 	        dns_type_str(msg.question.qtype, qtype_buf, sizeof(qtype_buf)),
 	        addr_buf, port);
@@ -505,7 +538,7 @@ handle_query(void *arg)
 	uint16_t query_id     = msg.header.id;
 	int      hit          = 0;
 
-	if (msg.cacheable)
+	if (dns_query_is_cacheable(&msg))
 		hit = cache_lookup(&task->srv->cache,
 		                   msg.question.name,
 		                   msg.question.qtype,
@@ -516,18 +549,18 @@ handle_query(void *arg)
 		                   msg.question_wire_len,
 		                   response, sizeof(response), &response_len);
 	if (hit == -2)
-		fprintf(stderr, "cache: expired %s %s\n",
+		log_msg(LOG_DEBUG, "cache: expired %s %s\n",
 		        msg.question.name,
 		        dns_type_str(msg.question.qtype, qtype_buf,
 		                     sizeof(qtype_buf)));
 	if (hit == -1)
-		fprintf(stderr,
+		log_msg(LOG_WARN,
 		        "cache: failed to build cached response for %s %s\n",
 		        msg.question.name,
 		        dns_type_str(msg.question.qtype, qtype_buf,
 		                     sizeof(qtype_buf)));
 	if (hit == 1) {
-		fprintf(stderr, "cache: hit %s %s (%zu bytes)\n",
+		log_msg(LOG_DEBUG, "cache: hit %s %s (%zu bytes)\n",
 		        msg.question.name,
 		        dns_type_str(msg.question.qtype, qtype_buf,
 		                     sizeof(qtype_buf)),
@@ -540,7 +573,7 @@ handle_query(void *arg)
 		                          &response_len);
 
 		if (rc < 0) {
-			fprintf(stderr,
+			log_msg(LOG_WARN,
 			        "server: upstream failed for %s, "
 			        "sending SERVFAIL\n",
 			        msg.question.name);
@@ -552,29 +585,28 @@ handle_query(void *arg)
 			        response, sizeof(response));
 			if (response_len == 0) {
 				release_task_slot(task);
-				return NULL;
+				return;
 			}
 		} else {
 			uint16_t rcode = response_len >= 4 ? (response[3] & DNS_FLAGS_RCODE_MASK) : 0;
-			fprintf(stderr, "reply: %s %s -> %s (%zu bytes)\n",
+			log_msg(LOG_INFO, "reply: %s %s -> %s (%zu bytes)\n",
 			        msg.question.name,
 			        dns_type_str(msg.question.qtype, qtype_buf,
 			                     sizeof(qtype_buf)),
-			        dns_rcode_str(rcode, rcode_buf,
-			                      sizeof(rcode_buf)),
+			        dns_rcode_str(rcode, rcode_buf, sizeof(rcode_buf)),
 			        response_len);
 
 			uint16_t flags     = wire_read_u16(response + 2);
 			uint32_t cache_ttl = (rcode == DNS_RCODE_SERVFAIL) ? CACHE_SERVFAIL_TTL : 0;
 
-			if (msg.cacheable
+			if (dns_query_is_cacheable(&msg)
 			    && (flags & DNS_FLAG_TC) == 0
 			    && (rcode == DNS_RCODE_OK
 			        || rcode == DNS_RCODE_NXDOMAIN
 			        || rcode == DNS_RCODE_SERVFAIL)) {
 				if (!dns_response_matches_query(&msg, response,
 				                                response_len)) {
-					fprintf(stderr,
+					log_msg(LOG_WARN,
 					        "cache: reject upstream reply "
 					        "for %s %s (question mismatch "
 					        "or malformed response)\n",
@@ -592,7 +624,7 @@ handle_query(void *arg)
 					             cache_ttl);
 				}
 			} else if ((flags & DNS_FLAG_TC) != 0) {
-				fprintf(stderr,
+				log_msg(LOG_DEBUG,
 				        "cache: skip truncated response for "
 				        "%s %s\n",
 				        msg.question.name,
@@ -607,11 +639,11 @@ handle_query(void *arg)
 	if (task->conn_fd < 0) {
 		size_t client_limit = client_udp_payload_limit(&msg.cache_key);
 		if (response_len > client_limit) {
-			size_t truncated_len = truncate_response_for_client(response, response_len,
-			                                                    client_limit);
+			size_t truncated_len = truncate_response_for_client(
+			        response, response_len, client_limit);
 			if (truncated_len == 0) {
 				release_task_slot(task);
-				return NULL;
+				return;
 			}
 			response_len = truncated_len;
 		}
@@ -619,18 +651,43 @@ handle_query(void *arg)
 
 	if (task->conn_fd >= 0) {
 		if (send_tcp_response(task->conn_fd, response, response_len) < 0)
-			fprintf(stderr, "server: TCP write: %s\n",
+			log_msg(LOG_ERROR, "server: TCP write: %s\n",
 			        strerror(errno));
 	} else {
 		ssize_t sent = sendto(task->sock_fd, response, response_len, 0,
 		                      (struct sockaddr *)&task->client_addr,
 		                      task->addr_len);
 		if (sent < 0)
-			fprintf(stderr, "server: sendto: %s\n", strerror(errno));
+			log_msg(LOG_ERROR, "server: sendto: %s\n",
+			        strerror(errno));
 	}
 
 	release_task_slot(task);
-	return NULL;
+}
+
+static void *
+worker_thread(void *arg)
+{
+	struct server *srv = arg;
+
+	pthread_mutex_lock(&srv->task_lock);
+	for (;;) {
+		while (srv->pending_count == 0 && !srv->shutdown)
+			pthread_cond_wait(&srv->work_cond, &srv->task_lock);
+		if (srv->shutdown && srv->pending_count == 0) {
+			pthread_mutex_unlock(&srv->task_lock);
+			return NULL;
+		}
+		int slot          = srv->pending[srv->pending_head];
+		srv->pending_head = (srv->pending_head + 1)
+		                    % MAX_CONCURRENT_QUERIES;
+		srv->pending_count--;
+		pthread_mutex_unlock(&srv->task_lock);
+
+		handle_query(&srv->query_tasks[slot]);
+
+		pthread_mutex_lock(&srv->task_lock);
+	}
 }
 
 static int
@@ -743,188 +800,77 @@ bind_tcp(int family, int port)
 }
 
 /*
- * Accept a TCP connection, read the 2-byte length-prefixed DNS message
- * (RFC 1035 §4.2.2), and dispatch it to the thread pool.  Blocks
- * briefly while reading; closes the connection on any error.
+ * Common dispatch path for UDP and TCP queries.  Takes the mutex,
+ * acquires a task slot, enqueues the task, and signals a worker.
+ * query/query_len are for UDP (already received); conn_fd >= 0 and
+ * query_len == 0 signals TCP (worker reads the query from conn_fd).
+ * On any error conn_fd is closed before returning.
  */
 static void
-accept_and_dispatch_tcp(struct server *srv, int listen_fd)
+dispatch_task(struct server *srv, const uint8_t *query, size_t query_len,
+              const struct sockaddr_storage *client_addr, socklen_t addr_len,
+              int sock_fd, int conn_fd)
 {
-	struct sockaddr_storage client_addr;
-	socklen_t               addr_len = sizeof(client_addr);
-
-	int                     conn_fd  = accept(listen_fd, (struct sockaddr *)&client_addr,
-	                                          &addr_len);
-	if (conn_fd < 0) {
-		if (errno != EINTR && errno != ECONNABORTED)
-			fprintf(stderr, "server: accept: %s\n", strerror(errno));
-		return;
-	}
-
-	/* Short read timeout to avoid blocking the accept thread */
-	struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
-	if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO,
-	               &tv, sizeof(tv))
-	    < 0) {
-		close(conn_fd);
-		return;
-	}
-
-	/* Read 2-byte message length (RFC 1035 §4.2.2) */
-	uint8_t len_buf[2];
-	ssize_t n = recv(conn_fd, len_buf, 2, MSG_WAITALL);
-	if (n != 2) {
-		close(conn_fd);
-		return;
-	}
-	uint16_t msg_size = (uint16_t)(((uint16_t)len_buf[0] << 8) | len_buf[1]);
-	if (msg_size < DNS_HEADER_SIZE || msg_size > DNS_MAX_MSG_SIZE) {
-		close(conn_fd);
-		return;
-	}
-
-	uint8_t query[DNS_MAX_MSG_SIZE];
-	n = recv(conn_fd, query, msg_size, MSG_WAITALL);
-	if (n != (ssize_t)msg_size) {
-		close(conn_fd);
-		return;
-	}
-
-	if (sem_trywait(&srv->query_sem) != 0) {
-		fprintf(stderr, "server: at capacity, dropping TCP query\n");
-		close(conn_fd);
-		return;
-	}
-
 	pthread_mutex_lock(&srv->task_lock);
-	int source_slot = acquire_source_slot_locked(srv, &client_addr);
+
+	if (srv->free_task_top == 0) {
+		pthread_mutex_unlock(&srv->task_lock);
+		if (conn_fd >= 0)
+			close(conn_fd);
+		log_msg(LOG_WARN, "server: at capacity, dropping query\n");
+		return;
+	}
+
+	int source_slot = acquire_source_slot_locked(srv, client_addr);
 	if (source_slot < 0) {
 		pthread_mutex_unlock(&srv->task_lock);
-		sem_post(&srv->query_sem);
-		fprintf(stderr,
-		        "server: TCP source concurrency limit exceeded\n");
-		close(conn_fd);
+		if (conn_fd >= 0)
+			close(conn_fd);
+		log_msg(LOG_WARN,
+		        "server: source concurrency limit exceeded\n");
 		return;
 	}
 
 	assert(srv->free_task_top > 0);
-	if (srv->free_task_top == 0) {
-		release_source_slot_locked(srv, source_slot);
-		pthread_mutex_unlock(&srv->task_lock);
-		sem_post(&srv->query_sem);
-		close(conn_fd);
-		return;
-	}
-
-	int slot = srv->free_task_slots[--srv->free_task_top];
-	pthread_mutex_unlock(&srv->task_lock);
+	int                slot = srv->free_task_slots[--srv->free_task_top];
 
 	struct query_task *task = &srv->query_tasks[slot];
 	task->srv               = srv;
 	task->slot              = slot;
 	task->source_slot       = source_slot;
-	task->sock_fd           = -1;
+	task->sock_fd           = sock_fd;
 	task->conn_fd           = conn_fd;
-	task->query_len         = msg_size;
+	task->query_len         = query_len;
 	task->addr_len          = addr_len;
-	memcpy(task->query, query, msg_size);
-	memcpy(&task->client_addr, &client_addr, sizeof(client_addr));
+	if (query && query_len > 0)
+		memcpy(task->query, query, query_len);
+	memcpy(&task->client_addr, client_addr, sizeof(*client_addr));
 
-	pthread_t      tid;
-	pthread_attr_t attr;
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
-	if (pthread_create(&tid, &attr, handle_query, task) != 0) {
-		fprintf(stderr, "server: pthread_create: %s\n", strerror(errno));
-		release_task_slot(task);
-	}
-
-	pthread_attr_destroy(&attr);
+	int tail           = (srv->pending_head + srv->pending_count)
+	                     % MAX_CONCURRENT_QUERIES;
+	srv->pending[tail] = slot;
+	srv->pending_count++;
+	pthread_cond_signal(&srv->work_cond);
+	pthread_mutex_unlock(&srv->task_lock);
 }
 
-int
-server_init(struct server *srv, const struct dns_config *cfg)
+static void
+accept_and_dispatch_tcp(struct server *srv, int listen_fd)
 {
-	memset(srv, 0, sizeof(*srv));
-	srv->sock_fd  = -1;
-	srv->sock_fd6 = -1;
-	srv->tcp_fd   = -1;
-	srv->tcp_fd6  = -1;
-	srv->config   = *cfg;
+	struct sockaddr_storage client_addr;
+	socklen_t               addr_len = sizeof(client_addr);
+	int                     conn_fd;
 
-	if (random_bytes(&srv->source_hash_seed,
-	                 sizeof(srv->source_hash_seed))
-	    < 0) {
-		fprintf(stderr, "server: failed to generate source hash seed\n");
-		return -1;
+	conn_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
+	if (conn_fd < 0) {
+		if (errno != EINTR && errno != ECONNABORTED)
+			log_msg(LOG_ERROR, "server: accept: %s\n",
+			        strerror(errno));
+		return;
 	}
 
-	if (cache_init(&srv->cache) < 0) {
-		fprintf(stderr, "server: cache_init failed\n");
-		return -1;
-	}
-
-	if (sem_init(&srv->query_sem, 0, MAX_CONCURRENT_QUERIES) < 0) {
-		fprintf(stderr, "server: sem_init: %s\n", strerror(errno));
-		cache_destroy(&srv->cache);
-		return -1;
-	}
-
-	if (pthread_mutex_init(&srv->task_lock, NULL) != 0) {
-		fprintf(stderr, "server: pthread_mutex_init failed\n");
-		sem_destroy(&srv->query_sem);
-		cache_destroy(&srv->cache);
-		return -1;
-	}
-
-	srv->free_task_top = MAX_CONCURRENT_QUERIES;
-	for (int i = 0; i < MAX_CONCURRENT_QUERIES; i++) {
-		srv->free_task_slots[i]         = MAX_CONCURRENT_QUERIES - 1 - i;
-		srv->query_tasks[i].source_slot = -1;
-		srv->query_tasks[i].conn_fd     = -1;
-	}
-
-	srv->sock_fd = bind_udp(AF_INET, srv->config.listen_port);
-	if (srv->sock_fd < 0) {
-		fprintf(stderr, "server: bind IPv4 UDP port %d: %s\n",
-		        srv->config.listen_port, strerror(errno));
-		pthread_mutex_destroy(&srv->task_lock);
-		sem_destroy(&srv->query_sem);
-		cache_destroy(&srv->cache);
-		return -1;
-	}
-
-	srv->sock_fd6 = bind_udp(AF_INET6, srv->config.listen_port);
-	if (srv->sock_fd6 < 0) {
-		fprintf(stderr, "server: warning: IPv6 UDP bind port %d "
-		                "failed: %s\n",
-		        srv->config.listen_port, strerror(errno));
-	}
-
-	srv->tcp_fd = bind_tcp(AF_INET, srv->config.listen_port);
-	if (srv->tcp_fd < 0) {
-		fprintf(stderr, "server: warning: IPv4 TCP bind port %d "
-		                "failed: %s\n",
-		        srv->config.listen_port, strerror(errno));
-	}
-
-	srv->tcp_fd6 = bind_tcp(AF_INET6, srv->config.listen_port);
-	if (srv->tcp_fd6 < 0) {
-		fprintf(stderr, "server: warning: IPv6 TCP bind port %d "
-		                "failed: %s\n",
-		        srv->config.listen_port, strerror(errno));
-	}
-
-	srv->running = 1;
-	fprintf(stderr, "server: listening on 0.0.0.0:%d (UDP+TCP), "
-	                "upstream %s:%d\n",
-	        srv->config.listen_port, srv->config.upstream_addr,
-	        srv->config.upstream_port);
-	fprintf(stderr, "server: warning: no client ACL and only basic "
-	                "per-source limits; not safe for public exposure\n");
-
-	return 0;
+	/* query_len=0 signals the worker to read the query from conn_fd */
+	dispatch_task(srv, NULL, 0, &client_addr, addr_len, -1, conn_fd);
 }
 
 static void
@@ -938,68 +884,134 @@ receive_and_dispatch(struct server *srv, int sock_fd)
 	n = recvfrom(sock_fd, query, sizeof(query), 0,
 	             (struct sockaddr *)&client_addr, &addr_len);
 	if (n < 0) {
-		fprintf(stderr, "server: recvfrom: %s\n", strerror(errno));
+		log_msg(LOG_ERROR, "server: recvfrom: %s\n", strerror(errno));
 		return;
 	}
 
 	if (n < DNS_HEADER_SIZE) {
-		fprintf(stderr, "server: runt packet (%zd bytes)\n", n);
+		log_msg(LOG_WARN, "server: runt packet (%zd bytes)\n", n);
 		return;
 	}
 
-	if (sem_trywait(&srv->query_sem) != 0) {
-		fprintf(stderr, "server: at capacity, dropping query\n");
-		return;
+	dispatch_task(srv, query, (size_t)n, &client_addr, addr_len,
+	              sock_fd, -1);
+}
+
+int
+server_init(struct server *srv, const struct dns_config *cfg)
+{
+	memset(srv, 0, sizeof(*srv));
+	srv->sock_fd      = -1;
+	srv->sock_fd6     = -1;
+	srv->tcp_fd       = -1;
+	srv->tcp_fd6      = -1;
+	srv->pending_head = 0;
+	srv->config       = *cfg;
+
+	if (random_bytes(&srv->source_hash_seed,
+	                 sizeof(srv->source_hash_seed))
+	    < 0) {
+		log_msg(LOG_ERROR,
+		        "server: failed to generate source hash seed\n");
+		return -1;
 	}
 
-	pthread_mutex_lock(&srv->task_lock);
-	int source_slot = acquire_source_slot_locked(srv, &client_addr);
-	if (source_slot < 0) {
-		pthread_mutex_unlock(&srv->task_lock);
-		sem_post(&srv->query_sem);
-		fprintf(stderr, "server: source concurrency limit exceeded\n");
-		return;
+	if (cache_init(&srv->cache) < 0) {
+		log_msg(LOG_ERROR, "server: cache_init failed\n");
+		return -1;
 	}
 
-	/*
-	 * Once query_sem is acquired and a source slot is reserved, a task
-	 * slot must be available.  The semaphore, source limiter, and task
-	 * pool stay aligned unless there is a logic bug elsewhere.
-	 */
-	assert(srv->free_task_top > 0);
-	if (srv->free_task_top == 0) {
-		release_source_slot_locked(srv, source_slot);
-		pthread_mutex_unlock(&srv->task_lock);
-		fprintf(stderr, "server: task pool exhausted\n");
-		sem_post(&srv->query_sem);
-		return;
+	if (pthread_mutex_init(&srv->task_lock, NULL) != 0) {
+		log_msg(LOG_ERROR, "server: pthread_mutex_init failed\n");
+		cache_destroy(&srv->cache);
+		return -1;
 	}
 
-	int slot = srv->free_task_slots[--srv->free_task_top];
-	pthread_mutex_unlock(&srv->task_lock);
-
-	struct query_task *task = &srv->query_tasks[slot];
-	task->srv               = srv;
-	task->slot              = slot;
-	task->source_slot       = source_slot;
-	task->sock_fd           = sock_fd;
-	task->conn_fd           = -1;
-	task->query_len         = (size_t)n;
-	task->addr_len          = addr_len;
-	memcpy(task->query, query, (size_t)n);
-	memcpy(&task->client_addr, &client_addr, sizeof(client_addr));
-
-	pthread_t      tid;
-	pthread_attr_t attr;
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
-	if (pthread_create(&tid, &attr, handle_query, task) != 0) {
-		fprintf(stderr, "server: pthread_create: %s\n", strerror(errno));
-		release_task_slot(task);
+	if (pthread_cond_init(&srv->work_cond, NULL) != 0) {
+		log_msg(LOG_ERROR, "server: pthread_cond_init failed\n");
+		pthread_mutex_destroy(&srv->task_lock);
+		cache_destroy(&srv->cache);
+		return -1;
 	}
 
-	pthread_attr_destroy(&attr);
+	srv->free_task_top = MAX_CONCURRENT_QUERIES;
+	for (int i = 0; i < MAX_CONCURRENT_QUERIES; i++) {
+		srv->free_task_slots[i]         = MAX_CONCURRENT_QUERIES - 1 - i;
+		srv->query_tasks[i].source_slot = -1;
+		srv->query_tasks[i].conn_fd     = -1;
+	}
+
+	srv->sock_fd = bind_udp(AF_INET, srv->config.listen_port);
+	if (srv->sock_fd < 0) {
+		log_msg(LOG_ERROR, "server: bind IPv4 UDP port %d: %s\n",
+		        srv->config.listen_port, strerror(errno));
+		pthread_cond_destroy(&srv->work_cond);
+		pthread_mutex_destroy(&srv->task_lock);
+		cache_destroy(&srv->cache);
+		return -1;
+	}
+
+	srv->sock_fd6 = bind_udp(AF_INET6, srv->config.listen_port);
+	if (srv->sock_fd6 < 0) {
+		log_msg(LOG_WARN, "server: warning: IPv6 UDP bind port %d "
+		                  "failed: %s\n",
+		        srv->config.listen_port, strerror(errno));
+	}
+
+	srv->tcp_fd = bind_tcp(AF_INET, srv->config.listen_port);
+	if (srv->tcp_fd < 0) {
+		log_msg(LOG_WARN, "server: warning: IPv4 TCP bind port %d "
+		                  "failed: %s\n",
+		        srv->config.listen_port, strerror(errno));
+	}
+
+	srv->tcp_fd6 = bind_tcp(AF_INET6, srv->config.listen_port);
+	if (srv->tcp_fd6 < 0) {
+		log_msg(LOG_WARN, "server: warning: IPv6 TCP bind port %d "
+		                  "failed: %s\n",
+		        srv->config.listen_port, strerror(errno));
+	}
+
+	/* Spawn the worker thread pool */
+	for (int i = 0; i < MAX_CONCURRENT_QUERIES; i++) {
+		if (pthread_create(&srv->pool[i], NULL, worker_thread,
+		                   srv)
+		    != 0) {
+			log_msg(LOG_ERROR,
+			        "server: failed to create worker thread %d: "
+			        "%s\n",
+			        i, strerror(errno));
+			/* Signal already-running threads to exit */
+			pthread_mutex_lock(&srv->task_lock);
+			srv->shutdown = true;
+			pthread_cond_broadcast(&srv->work_cond);
+			pthread_mutex_unlock(&srv->task_lock);
+			for (int j = 0; j < i; j++)
+				pthread_join(srv->pool[j], NULL);
+			if (srv->sock_fd >= 0)
+				close(srv->sock_fd);
+			if (srv->sock_fd6 >= 0)
+				close(srv->sock_fd6);
+			if (srv->tcp_fd >= 0)
+				close(srv->tcp_fd);
+			if (srv->tcp_fd6 >= 0)
+				close(srv->tcp_fd6);
+			pthread_cond_destroy(&srv->work_cond);
+			pthread_mutex_destroy(&srv->task_lock);
+			cache_destroy(&srv->cache);
+			return -1;
+		}
+	}
+
+	srv->running = 1;
+	log_msg(LOG_INFO, "server: listening on 0.0.0.0:%d (UDP+TCP), "
+	                  "upstream %s:%d\n",
+	        srv->config.listen_port, srv->config.upstream_addr,
+	        srv->config.upstream_port);
+	log_msg(LOG_WARN, "server: warning: no client ACL and only basic "
+	                  "per-source limits; not safe for public exposure\n");
+
+	return 0;
 }
 
 int
@@ -1035,7 +1047,7 @@ server_run(struct server *srv)
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
-			fprintf(stderr, "server: poll: %s\n", strerror(errno));
+			log_msg(LOG_ERROR, "server: poll: %s\n", strerror(errno));
 			return -1;
 		}
 
@@ -1057,54 +1069,19 @@ server_run(struct server *srv)
 	return 0;
 }
 
-static bool
-realtime_deadline_after_ms(struct timespec *deadline, long timeout_ms)
-{
-	if (clock_gettime(CLOCK_REALTIME, deadline) < 0)
-		return false;
-
-	deadline->tv_sec  += timeout_ms / 1000;
-	deadline->tv_nsec += (timeout_ms % 1000) * 1000000L;
-	if (deadline->tv_nsec >= 1000000000L) {
-		deadline->tv_sec++;
-		deadline->tv_nsec -= 1000000000L;
-	}
-
-	return true;
-}
-
-static bool
-drain_query_threads(struct server *srv)
-{
-	struct timespec deadline;
-
-	if (!realtime_deadline_after_ms(&deadline, 10000))
-		return false;
-
-	for (int i = 0; i < MAX_CONCURRENT_QUERIES;) {
-		if (sem_timedwait(&srv->query_sem, &deadline) == 0) {
-			i++;
-			continue;
-		}
-		if (errno == EINTR)
-			continue;
-		return false;
-	}
-
-	return true;
-}
-
 void
 server_stop(struct server *srv)
 {
 	srv->running = 0;
 
-	bool drained = drain_query_threads(srv);
-	if (!drained) {
-		fprintf(stderr, "server: warning: query threads did not drain "
-		                "within 10 seconds; process must exit "
-		                "immediately after shutdown\n");
-	}
+	/* Signal all idle workers to exit, then join them all */
+	pthread_mutex_lock(&srv->task_lock);
+	srv->shutdown = true;
+	pthread_cond_broadcast(&srv->work_cond);
+	pthread_mutex_unlock(&srv->task_lock);
+
+	for (int i = 0; i < MAX_CONCURRENT_QUERIES; i++)
+		pthread_join(srv->pool[i], NULL);
 
 	if (srv->sock_fd >= 0) {
 		close(srv->sock_fd);
@@ -1122,9 +1099,8 @@ server_stop(struct server *srv)
 		close(srv->tcp_fd6);
 		srv->tcp_fd6 = -1;
 	}
-	if (drained) {
-		pthread_mutex_destroy(&srv->task_lock);
-		sem_destroy(&srv->query_sem);
-		cache_destroy(&srv->cache);
-	}
+
+	pthread_cond_destroy(&srv->work_cond);
+	pthread_mutex_destroy(&srv->task_lock);
+	cache_destroy(&srv->cache);
 }
