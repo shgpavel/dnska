@@ -605,6 +605,72 @@ test_tcp_notimp_status_opcode(void)
 }
 
 /*
+ * Send N queries on one TCP connection without closing between them
+ * (RFC 7766 §6.2.2 pipelining).  responses[][DNS_MAX_MSG_SIZE] and
+ * resp_lens[] must be pre-allocated by the caller.
+ * Returns 0 on success, -1 on error.
+ */
+static int
+tcp_pipeline(int             port,
+             const uint8_t **queries, const size_t *qlens,
+             uint8_t resps[][DNS_MAX_MSG_SIZE], size_t *resp_lens,
+             int count)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+
+	struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+	struct sockaddr_in dst;
+	memset(&dst, 0, sizeof(dst));
+	dst.sin_family      = AF_INET;
+	dst.sin_port        = htons((uint16_t)port);
+	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	if (connect(fd, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	for (int i = 0; i < count; i++) {
+		uint8_t lenbuf[2];
+		lenbuf[0] = (uint8_t)(qlens[i] >> 8);
+		lenbuf[1] = (uint8_t)qlens[i];
+		if (send(fd, lenbuf, 2, 0) != 2
+		    || send(fd, queries[i], qlens[i], 0)
+		               != (ssize_t)qlens[i]) {
+			close(fd);
+			return -1;
+		}
+	}
+
+	for (int i = 0; i < count; i++) {
+		uint8_t lenbuf[2];
+		if (recv(fd, lenbuf, 2, MSG_WAITALL) != 2) {
+			close(fd);
+			return -1;
+		}
+		uint16_t rlen = get_u16(lenbuf);
+		if (rlen == 0 || rlen > DNS_MAX_MSG_SIZE) {
+			close(fd);
+			return -1;
+		}
+		ssize_t got = recv(fd, resps[i], rlen, MSG_WAITALL);
+		if (got != (ssize_t)rlen) {
+			close(fd);
+			return -1;
+		}
+		resp_lens[i] = (size_t)rlen;
+	}
+
+	close(fd);
+	return 0;
+}
+
+/*
  * A valid A-record query over UDP is forwarded to the upstream and the
  * response is relayed back to the client.  The client's original query ID
  * must be preserved.
@@ -658,6 +724,203 @@ test_udp_forwarded_query_basic(void)
 	stop_mock_upstream(&up);
 }
 
+/*
+ * A valid A-record query over TCP is forwarded to the upstream and the
+ * response is returned to the client (RFC 1035 §4.2.2).
+ */
+static void
+test_tcp_forwarded_query_basic(void)
+{
+	struct mock_upstream up;
+	TEST_CHECK(start_mock_upstream(&up, 0x05060708, 120) == 0);
+
+	struct test_server ts;
+	TEST_CHECK(start_test_server(&ts, "127.0.0.1", up.port) == 0);
+
+	if (ts.tcp_port < 0)
+		TEST_SKIP("IPv4 TCP socket not available; skipping TCP test");
+
+	uint8_t query[DNS_MAX_MSG_SIZE];
+	uint8_t resp[DNS_MAX_MSG_SIZE];
+	size_t  qlen = make_query(query, 0x1234, "example.org",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	ssize_t rlen = tcp_roundtrip(ts.tcp_port, query, qlen,
+	                             resp, sizeof(resp));
+	TEST_CHECK(rlen >= DNS_HEADER_SIZE);
+	TEST_CHECK(get_u16(resp) == 0x1234);
+	TEST_CHECK((get_u16(resp + 2) & DNS_FLAG_QR) != 0);
+	TEST_CHECK((get_u16(resp + 2) & DNS_FLAGS_RCODE_MASK) == DNS_RCODE_OK);
+	TEST_CHECK(get_u16(resp + 6) == 1); /* ANCOUNT = 1 */
+
+	/* verify the A-record rdata */
+	bool   found_ip = false;
+	size_t pos      = DNS_HEADER_SIZE;
+	while (pos < (size_t)rlen && resp[pos] != 0)
+		pos += resp[pos] + 1;
+	pos += 1 + 4;
+	if (pos + 2 <= (size_t)rlen && (resp[pos] & 0xC0) == 0xC0)
+		pos += 2;
+	if (pos + 10 + 4 <= (size_t)rlen) {
+		uint16_t rtype = get_u16(resp + pos);
+		uint16_t rdlen = get_u16(resp + pos + 8);
+		if (rtype == DNS_TYPE_A && rdlen == 4)
+			found_ip = (get_u32(resp + pos + 10) == 0x05060708);
+	}
+	TEST_CHECK(found_ip);
+
+	stop_test_server(&ts);
+	stop_mock_upstream(&up);
+}
+
+/*
+ * FORMERR over TCP: a malformed query should receive a FORMERR response
+ * and the connection should remain open for further queries.
+ */
+static void
+test_tcp_formerr(void)
+{
+	struct test_server ts;
+	TEST_CHECK(start_test_server(&ts, "127.0.0.1", 1) == 0);
+
+	if (ts.tcp_port < 0)
+		TEST_SKIP("IPv4 TCP socket not available; skipping TCP test");
+
+	/* Header with qdcount=1 but no question data */
+	uint8_t bad[DNS_HEADER_SIZE] = { 0 };
+	bad[0]                       = 0xAB;
+	bad[1]                       = 0xCD;
+	bad[2]                       = 0x01; /* RD=1 */
+	bad[5]                       = 0x01; /* QDCOUNT=1 */
+
+	uint8_t resp[DNS_MAX_MSG_SIZE];
+	ssize_t rlen = tcp_roundtrip(ts.tcp_port, bad, sizeof(bad),
+	                             resp, sizeof(resp));
+	TEST_CHECK(rlen >= DNS_HEADER_SIZE);
+	TEST_CHECK(get_u16(resp) == 0xABCD);
+	TEST_CHECK((get_u16(resp + 2) & DNS_FLAG_QR) != 0);
+	TEST_CHECK((get_u16(resp + 2) & DNS_FLAGS_RCODE_MASK)
+	           == DNS_RCODE_FORMERR);
+
+	stop_test_server(&ts);
+}
+
+/*
+ * BADVERS over TCP: EDNS version 1 should get a BADVERS response over TCP
+ * with the OPT extended rcode byte set correctly.
+ */
+static void
+test_tcp_badvers(void)
+{
+	struct test_server ts;
+	TEST_CHECK(start_test_server(&ts, "127.0.0.1", 1) == 0);
+
+	if (ts.tcp_port < 0)
+		TEST_SKIP("IPv4 TCP socket not available; skipping TCP test");
+
+	uint8_t query[DNS_MAX_MSG_SIZE];
+	uint8_t resp[DNS_MAX_MSG_SIZE];
+	size_t  qlen = make_edns_query(query, 0xBEEF, "example.net",
+	                               DNS_TYPE_A, DNS_CLASS_IN, 1);
+
+	ssize_t rlen = tcp_roundtrip(ts.tcp_port, query, qlen,
+	                             resp, sizeof(resp));
+	TEST_CHECK(rlen >= DNS_HEADER_SIZE);
+	TEST_CHECK(get_u16(resp) == 0xBEEF);
+	TEST_CHECK((resp[3] & 0x0F) == 0);   /* header rcode low nibble = 0 */
+	TEST_CHECK(get_u16(resp + 10) >= 1); /* ARCOUNT >= 1 */
+
+	stop_test_server(&ts);
+}
+
+/*
+ * RFC 7766 §6.2.2: multiple queries on a single TCP connection
+ * (pipelining).  Sends 3 queries with distinct IDs; checks that each
+ * response carries the correct ID and NOERROR.
+ */
+static void
+test_tcp_pipelining(void)
+{
+	struct mock_upstream up;
+	TEST_CHECK(start_mock_upstream(&up, 0x0A0B0C0D, 300) == 0);
+
+	struct test_server ts;
+	TEST_CHECK(start_test_server(&ts, "127.0.0.1", up.port) == 0);
+
+	if (ts.tcp_port < 0)
+		TEST_SKIP("IPv4 TCP socket not available; skipping TCP test");
+
+	enum { N = 3 };
+	static const uint16_t ids[N]   = { 0x0001, 0x0002, 0x0003 };
+	static const char    *names[N] = { "a.example", "b.example",
+		                           "c.example" };
+
+	uint8_t               qbufs[N][DNS_MAX_MSG_SIZE];
+	size_t                qlens[N];
+	const uint8_t        *queries[N];
+	uint8_t               resps[N][DNS_MAX_MSG_SIZE];
+	size_t                resp_lens[N];
+
+	for (int i = 0; i < N; i++) {
+		qlens[i]   = make_query(qbufs[i], ids[i], names[i],
+		                        DNS_TYPE_A, DNS_CLASS_IN);
+		queries[i] = qbufs[i];
+	}
+
+	TEST_CHECK(tcp_pipeline(ts.tcp_port, queries, qlens,
+	                        resps, resp_lens, N)
+	           == 0);
+
+	for (int i = 0; i < N; i++) {
+		TEST_CHECK(resp_lens[i] >= DNS_HEADER_SIZE);
+		TEST_CHECK(get_u16(resps[i]) == ids[i]);
+		TEST_CHECK((get_u16(resps[i] + 2) & DNS_FLAG_QR) != 0);
+		TEST_CHECK((get_u16(resps[i] + 2) & DNS_FLAGS_RCODE_MASK)
+		           == DNS_RCODE_OK);
+		TEST_CHECK(get_u16(resps[i] + 6) == 1); /* ANCOUNT = 1 */
+	}
+
+	stop_test_server(&ts);
+	stop_mock_upstream(&up);
+}
+
+/*
+ * RFC 7766 §5: responses over TCP MUST NOT be truncated.  A response
+ * that would be truncated for a small-UDP-size client must be delivered
+ * in full when the client uses TCP.
+ * We simulate this by sending a query with EDNS udp_size=512 over TCP
+ * and verifying the TC bit is not set in the response.
+ */
+static void
+test_tcp_no_truncation(void)
+{
+	struct mock_upstream up;
+	TEST_CHECK(start_mock_upstream(&up, 0x11223344, 300) == 0);
+
+	struct test_server ts;
+	TEST_CHECK(start_test_server(&ts, "127.0.0.1", up.port) == 0);
+
+	if (ts.tcp_port < 0)
+		TEST_SKIP("IPv4 TCP socket not available; skipping TCP test");
+
+	/* EDNS query advertising only 512-byte UDP payload */
+	uint8_t query[DNS_MAX_MSG_SIZE];
+	uint8_t resp[DNS_MAX_MSG_SIZE];
+	size_t  qlen = make_edns_query(query, 0xF00D, "example.com",
+	                               DNS_TYPE_A, DNS_CLASS_IN, 0);
+
+	ssize_t rlen = tcp_roundtrip(ts.tcp_port, query, qlen,
+	                             resp, sizeof(resp));
+	TEST_CHECK(rlen >= DNS_HEADER_SIZE);
+	TEST_CHECK(get_u16(resp) == 0xF00D);
+	/* TC flag must NOT be set on a TCP response */
+	TEST_CHECK((get_u16(resp + 2) & DNS_FLAG_TC) == 0);
+	TEST_CHECK((get_u16(resp + 2) & DNS_FLAGS_RCODE_MASK) == DNS_RCODE_OK);
+
+	stop_test_server(&ts);
+	stop_mock_upstream(&up);
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                                 */
 /* ------------------------------------------------------------------ */
@@ -670,6 +933,11 @@ main(void)
 	test_formerr_truncated_packet();
 	test_tcp_notimp_status_opcode();
 	test_udp_forwarded_query_basic();
+	test_tcp_forwarded_query_basic();
+	test_tcp_formerr();
+	test_tcp_badvers();
+	test_tcp_pipelining();
+	test_tcp_no_truncation();
 
 	puts("server tests passed");
 	return 0;

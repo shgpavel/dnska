@@ -19,6 +19,10 @@ static struct option          long_options[] = {
 	{ "port",          required_argument, NULL, 'p' },
 	{ "upstream",      required_argument, NULL, 'u' },
 	{ "upstream-port", required_argument, NULL, 'P' },
+	{ "upstream-tls",  no_argument,       NULL, 'T' },
+	{ "dot-port",      required_argument, NULL, 'd' },
+	{ "tls-cert",      required_argument, NULL, 'C' },
+	{ "tls-key",       required_argument, NULL, 'K' },
 	{ "verbose",       no_argument,       NULL, 'v' },
 	{ "help",          no_argument,       NULL, 'h' },
 	{ NULL,            0,                 NULL, 0   },
@@ -36,6 +40,14 @@ usage(const char *prog)
 	                "Upstream DNS server (default: 8.8.8.8)\n");
 	fprintf(stderr, "  -P, --upstream-port N  "
 	                "Upstream port (default: 53)\n");
+	fprintf(stderr, "  -T, --upstream-tls     "
+	                "Forward to upstream over DoT (RFC 7858)\n");
+	fprintf(stderr, "  -d, --dot-port PORT    "
+	                "Listen for DoT clients on PORT\n");
+	fprintf(stderr, "  -C, --tls-cert FILE    "
+	                "TLS certificate (PEM) for DoT listener\n");
+	fprintf(stderr, "  -K, --tls-key  FILE    "
+	                "TLS private key (PEM) for DoT listener\n");
 	fprintf(stderr, "  -v, --verbose          "
 	                "Enable debug logging\n");
 	fprintf(stderr, "  -h, --help             Show this help\n");
@@ -61,7 +73,7 @@ find_config_path(int argc, char **argv, const char **config_path,
 	*config_path     = "dnska.conf";
 	*config_explicit = false;
 
-	while ((opt = getopt_long(argc, argv, "c:p:u:P:vh",
+	while ((opt = getopt_long(argc, argv, "c:p:u:P:Td:C:K:vh",
 	                          long_options, NULL))
 	       != -1) {
 		if (opt == 'c') {
@@ -98,7 +110,7 @@ main(int argc, char **argv)
 	}
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "c:p:u:P:vh",
+	while ((opt = getopt_long(argc, argv, "c:p:u:P:Td:C:K:vh",
 	                          long_options, NULL))
 	       != -1) {
 		switch (opt) {
@@ -129,6 +141,27 @@ main(int argc, char **argv)
 			cfg.upstream_port = port;
 			break;
 		}
+		case 'T':
+			cfg.upstream_tls = true;
+			break;
+		case 'd': {
+			uint16_t port;
+			if (config_parse_port_u16(optarg, &port) < 0) {
+				fprintf(stderr, "error: invalid dot-port: %s\n",
+				        optarg);
+				return 1;
+			}
+			cfg.dot_port = (int)port;
+			break;
+		}
+		case 'C':
+			snprintf(cfg.tls_cert, sizeof(cfg.tls_cert),
+			         "%s", optarg);
+			break;
+		case 'K':
+			snprintf(cfg.tls_key, sizeof(cfg.tls_key),
+			         "%s", optarg);
+			break;
 		case 'v':
 			log_set_level(LOG_DEBUG);
 			break;

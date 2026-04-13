@@ -14,6 +14,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+
 #include "cache.h"
 #include "dns.h"
 #include "log.h"
@@ -21,6 +24,9 @@
 #include "resolver.h"
 #include "server.h"
 #include "wire.h"
+
+/* RFC 7766 §6.4: servers SHOULD implement an idle timeout >= 10 seconds */
+enum { TCP_IDLE_TIMEOUT_SEC = 10 };
 
 static void
 addr_str(const struct sockaddr_storage *addr, char *buf, size_t len,
@@ -359,6 +365,11 @@ release_source_slot_locked(struct server *srv, int source_slot)
 static void
 release_task_slot(struct query_task *task)
 {
+	if (task->tls != NULL) {
+		SSL_shutdown(task->tls);
+		SSL_free(task->tls);
+		task->tls = NULL;
+	}
 	if (task->conn_fd >= 0) {
 		close(task->conn_fd);
 		task->conn_fd = -1;
@@ -402,48 +413,80 @@ send_tcp_response(int fd, const uint8_t *response, size_t response_len)
 	return 0;
 }
 
-static void
-handle_query(struct query_task *task)
+static int
+tls_readn(SSL *ssl, uint8_t *buf, size_t len)
+{
+	size_t recvd = 0;
+
+	while (recvd < len) {
+		int n = SSL_read(ssl, buf + recvd, (int)(len - recvd));
+		if (n <= 0)
+			return -1;
+		recvd += (size_t)n;
+	}
+	return 0;
+}
+
+static int
+send_tls_response(SSL *ssl, const uint8_t *response, size_t response_len)
+{
+	uint8_t prefix[2];
+	size_t  sent = 0;
+
+	prefix[0]    = (uint8_t)(response_len >> 8);
+	prefix[1]    = (uint8_t)response_len;
+
+	while (sent < 2) {
+		int n = SSL_write(ssl, prefix + sent, (int)(2 - sent));
+		if (n <= 0)
+			return -1;
+		sent += (size_t)n;
+	}
+	sent = 0;
+	while (sent < response_len) {
+		int n = SSL_write(ssl, response + sent,
+		                  (int)(response_len - sent));
+		if (n <= 0)
+			return -1;
+		sent += (size_t)n;
+	}
+	return 0;
+}
+
+/*
+ * Unified response sender: TLS for DoT connections, TCP otherwise.
+ * For UDP connections (conn_fd < 0) always returns 0.
+ */
+static int
+send_response(struct query_task *task, const uint8_t *response,
+              size_t response_len)
+{
+	if (task->conn_fd >= 0) {
+		if (task->tls != NULL)
+			return send_tls_response(task->tls, response,
+			                         response_len);
+		return send_tcp_response(task->conn_fd, response, response_len);
+	}
+	sendto(task->sock_fd, response, response_len, 0,
+	       (struct sockaddr *)&task->client_addr, task->addr_len);
+	return 0;
+}
+
+/*
+ * Process the DNS query already in task->query[0..task->query_len-1].
+ * Sends the response via conn_fd (TCP) or sock_fd (UDP).
+ * Returns  0 on success or after sending an error response.
+ * Returns -1 on a fatal TCP I/O error (caller should close the connection).
+ * Does NOT call release_task_slot.
+ */
+static int
+process_dns_query(struct query_task *task)
 {
 	struct dns_message msg;
 	char               addr_buf[INET6_ADDRSTRLEN];
 	char               qtype_buf[32];
 	char               rcode_buf[32];
 	uint16_t           port;
-
-	/* TCP: read the length-prefixed query from the connection (RFC 1035
-	 * §4.2.2).  Moved here so the poll loop is never blocked on I/O. */
-	if (task->conn_fd >= 0 && task->query_len == 0) {
-		uint8_t        len_buf[2];
-		struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
-
-		if (setsockopt(task->conn_fd, SOL_SOCKET, SO_RCVTIMEO,
-		               &tv, sizeof(tv))
-		    < 0) {
-			release_task_slot(task);
-			return;
-		}
-
-		ssize_t n = recv(task->conn_fd, len_buf, 2, MSG_WAITALL);
-		if (n != 2) {
-			release_task_slot(task);
-			return;
-		}
-
-		uint16_t msg_size = (uint16_t)(((uint16_t)len_buf[0] << 8)
-		                               | len_buf[1]);
-		if (msg_size < DNS_HEADER_SIZE || msg_size > DNS_MAX_MSG_SIZE) {
-			release_task_slot(task);
-			return;
-		}
-
-		n = recv(task->conn_fd, task->query, msg_size, MSG_WAITALL);
-		if (n != (ssize_t)msg_size) {
-			release_task_slot(task);
-			return;
-		}
-		task->query_len = msg_size;
-	}
 
 	addr_str(&task->client_addr, addr_buf, sizeof(addr_buf), &port);
 
@@ -460,18 +503,9 @@ handle_query(struct query_task *task)
 
 		log_msg(LOG_WARN, "server: failed to parse query from %s:%d\n",
 		        addr_buf, port);
-		if (response_len > 0) {
-			if (task->conn_fd >= 0) {
-				send_tcp_response(task->conn_fd, response,
-				                  response_len);
-			} else {
-				sendto(task->sock_fd, response, response_len, 0,
-				       (struct sockaddr *)&task->client_addr,
-				       task->addr_len);
-			}
-		}
-		release_task_slot(task);
-		return;
+		if (response_len > 0)
+			return send_response(task, response, response_len);
+		return 0;
 	}
 
 	/* RFC 1035: return NOTIMP for opcodes we do not handle */
@@ -488,18 +522,9 @@ handle_query(struct query_task *task)
 
 		log_msg(LOG_WARN, "server: opcode %u from %s:%d -> NOTIMP\n",
 		        opcode, addr_buf, port);
-		if (response_len > 0) {
-			if (task->conn_fd >= 0) {
-				send_tcp_response(task->conn_fd, response,
-				                  response_len);
-			} else {
-				sendto(task->sock_fd, response, response_len, 0,
-				       (struct sockaddr *)&task->client_addr,
-				       task->addr_len);
-			}
-		}
-		release_task_slot(task);
-		return;
+		if (response_len > 0)
+			return send_response(task, response, response_len);
+		return 0;
 	}
 
 	/* RFC 6891 §6.1.3: reject EDNS version > 0 with BADVERS */
@@ -514,18 +539,9 @@ handle_query(struct query_task *task)
 		log_msg(LOG_WARN,
 		        "server: EDNS version %u from %s:%d -> BADVERS\n",
 		        msg.edns_version, addr_buf, port);
-		if (response_len > 0) {
-			if (task->conn_fd >= 0) {
-				send_tcp_response(task->conn_fd, response,
-				                  response_len);
-			} else {
-				sendto(task->sock_fd, response, response_len, 0,
-				       (struct sockaddr *)&task->client_addr,
-				       task->addr_len);
-			}
-		}
-		release_task_slot(task);
-		return;
+		if (response_len > 0)
+			return send_response(task, response, response_len);
+		return 0;
 	}
 
 	log_msg(LOG_INFO, "query: %s %s from %s:%d\n",
@@ -568,6 +584,7 @@ handle_query(struct query_task *task)
 	} else {
 		int rc = resolver_forward(task->srv->config.upstream_addr,
 		                          task->srv->config.upstream_port,
+		                          task->srv->config.upstream_tls,
 		                          task->query, task->query_len,
 		                          response, sizeof(response),
 		                          &response_len);
@@ -583,10 +600,8 @@ handle_query(struct query_task *task)
 			        msg.question_wire_len,
 			        DNS_RCODE_SERVFAIL,
 			        response, sizeof(response));
-			if (response_len == 0) {
-				release_task_slot(task);
-				return;
-			}
+			if (response_len == 0)
+				return 0;
 		} else {
 			uint16_t rcode = response_len >= 4 ? (response[3] & DNS_FLAGS_RCODE_MASK) : 0;
 			log_msg(LOG_INFO, "reply: %s %s -> %s (%zu bytes)\n",
@@ -634,34 +649,115 @@ handle_query(struct query_task *task)
 		}
 	}
 
-	/* For TCP clients, the full response is always usable; for UDP,
-	 * respect the client's advertised payload limit. */
+	/* For TCP clients, the full response is always usable (RFC 7766
+	 * §5); for UDP, respect the client's advertised payload limit. */
 	if (task->conn_fd < 0) {
 		size_t client_limit = client_udp_payload_limit(&msg.cache_key);
 		if (response_len > client_limit) {
 			size_t truncated_len = truncate_response_for_client(
 			        response, response_len, client_limit);
-			if (truncated_len == 0) {
-				release_task_slot(task);
-				return;
-			}
+			if (truncated_len == 0)
+				return 0;
 			response_len = truncated_len;
 		}
 	}
 
-	if (task->conn_fd >= 0) {
-		if (send_tcp_response(task->conn_fd, response, response_len) < 0)
-			log_msg(LOG_ERROR, "server: TCP write: %s\n",
-			        strerror(errno));
-	} else {
-		ssize_t sent = sendto(task->sock_fd, response, response_len, 0,
-		                      (struct sockaddr *)&task->client_addr,
-		                      task->addr_len);
-		if (sent < 0)
-			log_msg(LOG_ERROR, "server: sendto: %s\n",
-			        strerror(errno));
+	if (send_response(task, response, response_len) < 0) {
+		log_msg(LOG_ERROR, "server: write response: %s\n",
+		        strerror(errno));
+		return -1;
 	}
 
+	return 0;
+}
+
+/*
+ * Entry point for a query worker.  For UDP, process the single query
+ * already in task->query.  For TCP and DoT (RFC 7766 §6.2.2 / RFC 7858),
+ * read length-prefixed messages in a loop until the client closes the
+ * connection or the idle timeout expires (RFC 7766 §6.4).  DoT performs
+ * the TLS handshake before entering the read loop.
+ */
+static void
+handle_query(struct query_task *task)
+{
+	if (task->conn_fd >= 0) {
+		/* DoT: perform TLS handshake before reading queries */
+		if (task->tls_ctx != NULL) {
+			SSL *ssl = SSL_new(task->tls_ctx);
+			if (ssl == NULL || SSL_set_fd(ssl, task->conn_fd) != 1) {
+				log_msg(LOG_ERROR,
+				        "server: DoT SSL_new/set_fd failed\n");
+				if (ssl != NULL)
+					SSL_free(ssl);
+				release_task_slot(task);
+				return;
+			}
+			if (SSL_accept(ssl) <= 0) {
+				log_msg(LOG_WARN,
+				        "server: DoT TLS handshake failed: %s\n",
+				        ERR_reason_error_string(ERR_get_error()));
+				SSL_free(ssl);
+				release_task_slot(task);
+				return;
+			}
+			task->tls = ssl;
+		}
+
+		struct timeval tv = { .tv_sec  = TCP_IDLE_TIMEOUT_SEC,
+			              .tv_usec = 0 };
+		if (setsockopt(task->conn_fd, SOL_SOCKET, SO_RCVTIMEO,
+		               &tv, sizeof(tv))
+		            < 0
+		    || setsockopt(task->conn_fd, SOL_SOCKET, SO_SNDTIMEO,
+		                  &tv, sizeof(tv))
+		               < 0) {
+			release_task_slot(task);
+			return;
+		}
+
+		for (;;) {
+			uint8_t  len_buf[2];
+			uint16_t msg_size;
+
+			if (task->tls != NULL) {
+				if (tls_readn(task->tls, len_buf, 2) < 0)
+					break;
+			} else {
+				ssize_t n = recv(task->conn_fd, len_buf, 2,
+				                 MSG_WAITALL);
+				if (n != 2)
+					break;
+			}
+
+			msg_size = (uint16_t)(((uint16_t)len_buf[0] << 8)
+			                      | len_buf[1]);
+			if (msg_size < DNS_HEADER_SIZE
+			    || msg_size > DNS_MAX_MSG_SIZE)
+				break;
+
+			if (task->tls != NULL) {
+				if (tls_readn(task->tls, task->query,
+				              msg_size)
+				    < 0)
+					break;
+			} else {
+				ssize_t n = recv(task->conn_fd, task->query,
+				                 msg_size, MSG_WAITALL);
+				if (n != (ssize_t)msg_size)
+					break;
+			}
+			task->query_len = (size_t)msg_size;
+
+			if (process_dns_query(task) < 0)
+				break;
+		}
+
+		release_task_slot(task);
+		return;
+	}
+
+	process_dns_query(task);
 	release_task_slot(task);
 }
 
@@ -809,7 +905,7 @@ bind_tcp(int family, int port)
 static void
 dispatch_task(struct server *srv, const uint8_t *query, size_t query_len,
               const struct sockaddr_storage *client_addr, socklen_t addr_len,
-              int sock_fd, int conn_fd)
+              int sock_fd, int conn_fd, SSL_CTX *tls_ctx)
 {
 	pthread_mutex_lock(&srv->task_lock);
 
@@ -840,6 +936,8 @@ dispatch_task(struct server *srv, const uint8_t *query, size_t query_len,
 	task->source_slot       = source_slot;
 	task->sock_fd           = sock_fd;
 	task->conn_fd           = conn_fd;
+	task->tls_ctx           = tls_ctx;
+	task->tls               = NULL;
 	task->query_len         = query_len;
 	task->addr_len          = addr_len;
 	if (query && query_len > 0)
@@ -864,13 +962,32 @@ accept_and_dispatch_tcp(struct server *srv, int listen_fd)
 	conn_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
 	if (conn_fd < 0) {
 		if (errno != EINTR && errno != ECONNABORTED)
-			log_msg(LOG_ERROR, "server: accept: %s\n",
+			log_msg(LOG_ERROR, "server: TCP accept: %s\n",
 			        strerror(errno));
 		return;
 	}
 
 	/* query_len=0 signals the worker to read the query from conn_fd */
-	dispatch_task(srv, NULL, 0, &client_addr, addr_len, -1, conn_fd);
+	dispatch_task(srv, NULL, 0, &client_addr, addr_len, -1, conn_fd, NULL);
+}
+
+static void
+accept_and_dispatch_dot(struct server *srv, int listen_fd)
+{
+	struct sockaddr_storage client_addr;
+	socklen_t               addr_len = sizeof(client_addr);
+	int                     conn_fd;
+
+	conn_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
+	if (conn_fd < 0) {
+		if (errno != EINTR && errno != ECONNABORTED)
+			log_msg(LOG_ERROR, "server: DoT accept: %s\n",
+			        strerror(errno));
+		return;
+	}
+
+	dispatch_task(srv, NULL, 0, &client_addr, addr_len, -1, conn_fd,
+	              srv->tls_ctx);
 }
 
 static void
@@ -894,7 +1011,7 @@ receive_and_dispatch(struct server *srv, int sock_fd)
 	}
 
 	dispatch_task(srv, query, (size_t)n, &client_addr, addr_len,
-	              sock_fd, -1);
+	              sock_fd, -1, NULL);
 }
 
 int
@@ -905,6 +1022,9 @@ server_init(struct server *srv, const struct dns_config *cfg)
 	srv->sock_fd6     = -1;
 	srv->tcp_fd       = -1;
 	srv->tcp_fd6      = -1;
+	srv->dot_fd       = -1;
+	srv->dot_fd6      = -1;
+	srv->tls_ctx      = NULL;
 	srv->pending_head = 0;
 	srv->config       = *cfg;
 
@@ -939,6 +1059,8 @@ server_init(struct server *srv, const struct dns_config *cfg)
 		srv->free_task_slots[i]         = MAX_CONCURRENT_QUERIES - 1 - i;
 		srv->query_tasks[i].source_slot = -1;
 		srv->query_tasks[i].conn_fd     = -1;
+		srv->query_tasks[i].tls_ctx     = NULL;
+		srv->query_tasks[i].tls         = NULL;
 	}
 
 	srv->sock_fd = bind_udp(AF_INET, srv->config.listen_port);
@@ -972,6 +1094,47 @@ server_init(struct server *srv, const struct dns_config *cfg)
 		        srv->config.listen_port, strerror(errno));
 	}
 
+	/* DoT listener (RFC 7858): requires cert and key paths */
+	if (cfg->dot_port > 0
+	    && cfg->tls_cert[0] != '\0'
+	    && cfg->tls_key[0] != '\0') {
+		SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+		if (ctx == NULL) {
+			log_msg(LOG_ERROR,
+			        "server: DoT SSL_CTX_new failed\n");
+		} else {
+			SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+			if (SSL_CTX_use_certificate_file(ctx, cfg->tls_cert,
+			                                 SSL_FILETYPE_PEM)
+			            != 1
+			    || SSL_CTX_use_PrivateKey_file(ctx, cfg->tls_key,
+			                                   SSL_FILETYPE_PEM)
+			               != 1) {
+				log_msg(LOG_ERROR,
+				        "server: DoT failed to load cert/key: "
+				        "cert=%s key=%s\n",
+				        cfg->tls_cert, cfg->tls_key);
+				SSL_CTX_free(ctx);
+			} else {
+				srv->tls_ctx = ctx;
+				srv->dot_fd  = bind_tcp(AF_INET,
+				                        cfg->dot_port);
+				if (srv->dot_fd < 0)
+					log_msg(LOG_WARN,
+					        "server: warning: IPv4 DoT bind "
+					        "port %d failed: %s\n",
+					        cfg->dot_port, strerror(errno));
+				srv->dot_fd6 = bind_tcp(AF_INET6,
+				                        cfg->dot_port);
+				if (srv->dot_fd6 < 0)
+					log_msg(LOG_WARN,
+					        "server: warning: IPv6 DoT bind "
+					        "port %d failed: %s\n",
+					        cfg->dot_port, strerror(errno));
+			}
+		}
+	}
+
 	/* Spawn the worker thread pool */
 	for (int i = 0; i < MAX_CONCURRENT_QUERIES; i++) {
 		if (pthread_create(&srv->pool[i], NULL, worker_thread,
@@ -996,6 +1159,12 @@ server_init(struct server *srv, const struct dns_config *cfg)
 				close(srv->tcp_fd);
 			if (srv->tcp_fd6 >= 0)
 				close(srv->tcp_fd6);
+			if (srv->dot_fd >= 0)
+				close(srv->dot_fd);
+			if (srv->dot_fd6 >= 0)
+				close(srv->dot_fd6);
+			if (srv->tls_ctx != NULL)
+				SSL_CTX_free(srv->tls_ctx);
 			pthread_cond_destroy(&srv->work_cond);
 			pthread_mutex_destroy(&srv->task_lock);
 			cache_destroy(&srv->cache);
@@ -1005,9 +1174,14 @@ server_init(struct server *srv, const struct dns_config *cfg)
 
 	srv->running = 1;
 	log_msg(LOG_INFO, "server: listening on 0.0.0.0:%d (UDP+TCP), "
-	                  "upstream %s:%d\n",
+	                  "upstream %s:%d%s\n",
 	        srv->config.listen_port, srv->config.upstream_addr,
-	        srv->config.upstream_port);
+	        srv->config.upstream_port,
+	        srv->config.upstream_tls ? " (DoT)" : "");
+	if (srv->tls_ctx != NULL)
+		log_msg(LOG_INFO,
+		        "server: DoT listener on port %d\n",
+		        srv->config.dot_port);
 	log_msg(LOG_WARN, "server: warning: no client ACL and only basic "
 	                  "per-source limits; not safe for public exposure\n");
 
@@ -1018,7 +1192,7 @@ int
 server_run(struct server *srv)
 {
 	while (srv->running) {
-		struct pollfd pfds[4];
+		struct pollfd pfds[6];
 		nfds_t        nfds = 0;
 
 		memset(pfds, 0, sizeof(pfds));
@@ -1042,6 +1216,16 @@ server_run(struct server *srv)
 			pfds[nfds].events = POLLIN;
 			nfds++;
 		}
+		if (srv->dot_fd >= 0) {
+			pfds[nfds].fd     = srv->dot_fd;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
+		if (srv->dot_fd6 >= 0) {
+			pfds[nfds].fd     = srv->dot_fd6;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
 
 		int ret = poll(pfds, nfds, 1000);
 		if (ret < 0) {
@@ -1057,8 +1241,11 @@ server_run(struct server *srv)
 		for (nfds_t i = 0; i < nfds; i++) {
 			if ((pfds[i].revents & POLLIN) == 0)
 				continue;
-			if (pfds[i].fd == srv->tcp_fd
-			    || pfds[i].fd == srv->tcp_fd6) {
+			if (pfds[i].fd == srv->dot_fd
+			    || pfds[i].fd == srv->dot_fd6) {
+				accept_and_dispatch_dot(srv, pfds[i].fd);
+			} else if (pfds[i].fd == srv->tcp_fd
+			           || pfds[i].fd == srv->tcp_fd6) {
 				accept_and_dispatch_tcp(srv, pfds[i].fd);
 			} else {
 				receive_and_dispatch(srv, pfds[i].fd);
@@ -1098,6 +1285,18 @@ server_stop(struct server *srv)
 	if (srv->tcp_fd6 >= 0) {
 		close(srv->tcp_fd6);
 		srv->tcp_fd6 = -1;
+	}
+	if (srv->dot_fd >= 0) {
+		close(srv->dot_fd);
+		srv->dot_fd = -1;
+	}
+	if (srv->dot_fd6 >= 0) {
+		close(srv->dot_fd6);
+		srv->dot_fd6 = -1;
+	}
+	if (srv->tls_ctx != NULL) {
+		SSL_CTX_free(srv->tls_ctx);
+		srv->tls_ctx = NULL;
 	}
 
 	pthread_cond_destroy(&srv->work_cond);

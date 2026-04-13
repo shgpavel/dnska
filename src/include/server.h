@@ -11,6 +11,8 @@
 #include <stdint.h>
 #include <sys/socket.h>
 
+#include <openssl/ssl.h>
+
 #include "cache.h"
 #include "config.h"
 #include "dns.h"
@@ -34,9 +36,11 @@ struct query_task {
 	int                     slot;
 	int                     source_slot;
 	int                     sock_fd;   /* UDP: server bound socket, or -1 */
-	int                     conn_fd;   /* TCP: accepted connection, or -1 */
+	int                     conn_fd;   /* TCP/DoT: accepted conn, or -1 */
+	SSL_CTX                *tls_ctx;   /* non-NULL if incoming DoT conn */
+	SSL                    *tls;       /* allocated in handle_query() */
 	uint8_t                 query[DNS_MAX_MSG_SIZE];
-	size_t                  query_len; /* 0 for TCP tasks pending read */
+	size_t                  query_len; /* 0 for TCP/DoT tasks pending read */
 	struct sockaddr_storage client_addr;
 	socklen_t               addr_len;
 };
@@ -47,6 +51,9 @@ struct server {
 	int                       sock_fd6;
 	int                       tcp_fd;
 	int                       tcp_fd6;
+	int                       dot_fd;  /* DoT IPv4 listen socket, or -1 */
+	int                       dot_fd6; /* DoT IPv6 listen socket, or -1 */
+	SSL_CTX                  *tls_ctx; /* server TLS context for DoT */
 	volatile sig_atomic_t     running;
 	pthread_t                 pool[MAX_CONCURRENT_QUERIES];
 	pthread_mutex_t           task_lock;

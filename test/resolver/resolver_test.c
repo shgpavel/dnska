@@ -93,10 +93,10 @@ serve_upstream(void *arg)
 	fixture->observed_flags = wire_read_u16(query + 2);
 
 	/* Copy QNAME bytes from question section */
-	size_t qpos = DNS_HEADER_SIZE;
-	size_t qlen = 0;
+	size_t qpos             = DNS_HEADER_SIZE;
+	size_t qlen             = 0;
 	while (qpos < (size_t)recvd && qlen < sizeof(fixture->observed_qname)) {
-		uint8_t label_len = query[qpos];
+		uint8_t label_len               = query[qpos];
 		fixture->observed_qname[qlen++] = label_len;
 		if (label_len == 0)
 			break;
@@ -108,15 +108,14 @@ serve_upstream(void *arg)
 		if (qpos + label_len > (size_t)recvd)
 			break;
 		memcpy(fixture->observed_qname + qlen, query + qpos, label_len);
-		qlen  += label_len;
-		qpos  += label_len;
+		qlen += label_len;
+		qpos += label_len;
 	}
 	fixture->observed_qname_len = qlen;
 
 	memcpy(response, query, (size_t)recvd);
 	write_u16(response + 2,
-	          DNS_FLAG_QR | DNS_FLAG_RA
-	          | (fixture->observed_flags & DNS_FLAG_RD));
+	          DNS_FLAG_QR | DNS_FLAG_RA | (fixture->observed_flags & DNS_FLAG_RD));
 
 	/* First send: wrong ID → resolver should ignore and wait */
 	write_u16(response, (uint16_t)(fixture->observed_id ^ 0xFFFFu));
@@ -169,9 +168,10 @@ test_id_randomized_flags_stripped(void)
 	query_len = make_query(query, 0x1234,
 	                       DNS_FLAG_RD | DNS_FLAG_AD | DNS_FLAG_CD,
 	                       "example.com");
-	rc = resolver_forward("127.0.0.1", ntohs(upstream_addr.sin_port),
-	                      query, query_len,
-	                      response, sizeof(response), &response_len);
+	rc        = resolver_forward("127.0.0.1", ntohs(upstream_addr.sin_port),
+	                             false,
+	                             query, query_len,
+	                             response, sizeof(response), &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture.fd);
@@ -205,9 +205,9 @@ test_id_randomized_flags_stripped(void)
  * (including whatever QNAME case it received).
  */
 struct echo_fixture {
-	int      fd;
-	uint8_t  received_query[DNS_MAX_MSG_SIZE];
-	ssize_t  received_len;
+	int     fd;
+	uint8_t received_query[DNS_MAX_MSG_SIZE];
+	ssize_t received_len;
 };
 
 static void *
@@ -219,15 +219,14 @@ serve_echo(void *arg)
 	uint8_t              response[DNS_MAX_MSG_SIZE];
 
 	fixture->received_len = recvfrom(
-	    fixture->fd, fixture->received_query, sizeof(fixture->received_query),
-	    0, (struct sockaddr *)&client_addr, &client_len);
+	        fixture->fd, fixture->received_query, sizeof(fixture->received_query),
+	        0, (struct sockaddr *)&client_addr, &client_len);
 
 	TEST_CHECK(fixture->received_len >= (ssize_t)DNS_HEADER_SIZE);
 
 	memcpy(response, fixture->received_query,
 	       (size_t)fixture->received_len);
-	write_u16(response + 2, DNS_FLAG_QR | DNS_FLAG_RA
-	          | (wire_read_u16(response + 2) & DNS_FLAG_RD));
+	write_u16(response + 2, DNS_FLAG_QR | DNS_FLAG_RA | (wire_read_u16(response + 2) & DNS_FLAG_RD));
 	/* Keep the same ID the resolver sent */
 	sendto(fixture->fd, response, (size_t)fixture->received_len, 0,
 	       (struct sockaddr *)&client_addr, client_len);
@@ -268,6 +267,7 @@ test_0x20_randomization_uppercase_present(void)
 	/* "example.com" has 10 alphabetic bytes: P(all lower) = 1/1024 */
 	query_len = make_query(query, 0xABCD, DNS_FLAG_RD, "example.com");
 	resolver_forward("127.0.0.1", ntohs(upstream_addr.sin_port),
+	                 false,
 	                 query, query_len,
 	                 response, sizeof(response), &response_len);
 
@@ -323,14 +323,14 @@ test_0x20_randomization_uppercase_present(void)
 /* --- TCP fallback on TC=1 (RFC 7766 §6.2.1) --- */
 
 struct tc_upstream_fixture {
-	int         udp_fd;
-	int         tcp_listen_fd;
-	uint16_t    port;
+	int      udp_fd;
+	int      tcp_listen_fd;
+	uint16_t port;
 	/* Full A-record response to send over TCP */
-	uint8_t     full_response[DNS_MAX_MSG_SIZE];
-	size_t      full_response_len;
+	uint8_t  full_response[DNS_MAX_MSG_SIZE];
+	size_t   full_response_len;
 	/* Captured upstream ID from the UDP query */
-	uint16_t    upstream_id;
+	uint16_t upstream_id;
 };
 
 /*
@@ -402,15 +402,15 @@ serve_tc_then_tcp(void *arg)
 static void
 test_tcp_fallback_on_truncation(void)
 {
-	struct tc_upstream_fixture  fx;
-	struct sockaddr_in          addr;
-	socklen_t                   addr_len = sizeof(addr);
-	pthread_t                   thread;
-	uint8_t                     query[DNS_MAX_MSG_SIZE];
-	uint8_t                     response[DNS_MAX_MSG_SIZE];
-	size_t                      query_len;
-	size_t                      response_len = 0;
-	int                         rc;
+	struct tc_upstream_fixture fx;
+	struct sockaddr_in         addr;
+	socklen_t                  addr_len = sizeof(addr);
+	pthread_t                  thread;
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	size_t                     query_len;
+	size_t                     response_len = 0;
+	int                        rc;
 
 	memset(&fx, 0, sizeof(fx));
 
@@ -428,7 +428,7 @@ test_tcp_fallback_on_truncation(void)
 	TEST_CHECK(getsockname(fx.udp_fd, (struct sockaddr *)&addr,
 	                       &addr_len)
 	           == 0);
-	fx.port = ntohs(addr.sin_port);
+	fx.port          = ntohs(addr.sin_port);
 
 	/* Bind TCP socket on the same port */
 	fx.tcp_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -452,31 +452,32 @@ test_tcp_fallback_on_truncation(void)
 	write_u16(fx.full_response + 4, 1);
 	write_u16(fx.full_response + 6, 1);
 
-	fpos  = append_name(fx.full_response, fpos, "example.com");
+	fpos = append_name(fx.full_response, fpos, "example.com");
 	write_u16(fx.full_response + fpos, DNS_TYPE_A);
 	write_u16(fx.full_response + fpos + 2, DNS_CLASS_IN);
-	fpos += 4;
+	fpos                     += 4;
 
-	fx.full_response[fpos++] = 0xC0;
-	fx.full_response[fpos++] = DNS_HEADER_SIZE;
+	fx.full_response[fpos++]  = 0xC0;
+	fx.full_response[fpos++]  = DNS_HEADER_SIZE;
 	write_u16(fx.full_response + fpos, DNS_TYPE_A);
 	write_u16(fx.full_response + fpos + 2, DNS_CLASS_IN);
 	write_u16(fx.full_response + fpos + 4, 0);
 	write_u16(fx.full_response + fpos + 6, 300); /* TTL */
 	write_u16(fx.full_response + fpos + 8, 4);
-	fpos += 10;
-	fx.full_response[fpos++] = 93;
-	fx.full_response[fpos++] = 184;
-	fx.full_response[fpos++] = 216;
-	fx.full_response[fpos++] = 34;
-	fx.full_response_len = fpos;
+	fpos                     += 10;
+	fx.full_response[fpos++]  = 93;
+	fx.full_response[fpos++]  = 184;
+	fx.full_response[fpos++]  = 216;
+	fx.full_response[fpos++]  = 34;
+	fx.full_response_len      = fpos;
 
 	TEST_CHECK(pthread_create(&thread, NULL, serve_tc_then_tcp, &fx) == 0);
 
 	query_len = make_query(query, 0x1234, DNS_FLAG_RD, "example.com");
-	rc = resolver_forward("127.0.0.1", fx.port,
-	                      query, query_len,
-	                      response, sizeof(response), &response_len);
+	rc        = resolver_forward("127.0.0.1", fx.port,
+	                             false,
+	                             query, query_len,
+	                             response, sizeof(response), &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fx.udp_fd);

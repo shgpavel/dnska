@@ -1,7 +1,7 @@
 CC      = clang
 CFLAGS  = -std=c23 -Wall -Wextra -Wpedantic -O2 -D_POSIX_C_SOURCE=200809L \
           -Isrc/include -Itest
-LDFLAGS = -pthread
+LDFLAGS = -pthread -lssl -lcrypto
 
 SRCDIR  = src
 OBJDIR  = build

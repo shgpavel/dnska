@@ -117,6 +117,28 @@ config_load(const char *path, struct dns_config *cfg)
 				return -1;
 			}
 			cfg->upstream_port = port;
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "dot_port") == 0) {
+			uint16_t port;
+
+			if (config_parse_port_u16(val, &port) < 0) {
+				fprintf(stderr, "config: invalid dot_port: %s\n",
+				        val);
+				fclose(f);
+				return -1;
+			}
+			cfg->dot_port = (int)port;
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "upstream_tls") == 0) {
+			cfg->upstream_tls = (strcmp(val, "1") == 0
+			                     || strcmp(val, "yes") == 0
+			                     || strcmp(val, "true") == 0);
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "tls_cert") == 0) {
+			snprintf(cfg->tls_cert, sizeof(cfg->tls_cert), "%s", val);
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "tls_key") == 0) {
+			snprintf(cfg->tls_key, sizeof(cfg->tls_key), "%s", val);
 		} else {
 			fprintf(stderr,
 			        "config: warning: unrecognized key '%s' in section '[%s]'\n",

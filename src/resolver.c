@@ -4,12 +4,17 @@
 #include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 
 #include "dns.h"
 #include "random.h"
@@ -22,6 +27,20 @@ enum {
 	RESOLVER_TIMEOUT_SEC       = 3,
 	RESOLVER_ID_MISMATCH_LIMIT = 3,
 };
+
+static SSL_CTX       *client_tls_ctx;
+static pthread_once_t client_tls_once = PTHREAD_ONCE_INIT;
+
+static void
+init_client_tls_ctx(void)
+{
+	SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+	if (ctx == NULL)
+		return;
+	SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+	client_tls_ctx = ctx;
+}
 
 static int
 writen(int fd, const uint8_t *buf, size_t len)
@@ -170,6 +189,156 @@ bind_random_source_port(int fd, int family)
 	return -1;
 }
 
+static int
+ssl_readn(SSL *ssl, uint8_t *buf, size_t len)
+{
+	size_t recvd = 0;
+
+	while (recvd < len) {
+		int n = SSL_read(ssl, buf + recvd, (int)(len - recvd));
+		if (n <= 0)
+			return -1;
+		recvd += (size_t)n;
+	}
+	return 0;
+}
+
+static int
+ssl_writen(SSL *ssl, const uint8_t *buf, size_t len)
+{
+	size_t sent = 0;
+
+	while (sent < len) {
+		int n = SSL_write(ssl, buf + sent, (int)(len - sent));
+		if (n <= 0)
+			return -1;
+		sent += (size_t)n;
+	}
+	return 0;
+}
+
+/*
+ * Forward query to upstream over DNS-over-TLS (RFC 7858).
+ * Uses TCP with a TLS layer; same length-prefix framing as DNS-over-TCP.
+ */
+static int
+forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
+            int            family,
+            const uint8_t *query, size_t query_len,
+            uint16_t upstream_id, const uint8_t *orig_query,
+            uint8_t *response, size_t response_size,
+            size_t *response_len)
+{
+	uint8_t len_buf[2];
+	SSL    *ssl = NULL;
+
+	pthread_once(&client_tls_once, init_client_tls_ctx);
+	if (client_tls_ctx == NULL) {
+		fprintf(stderr, "resolver: TLS context unavailable\n");
+		return -1;
+	}
+
+	int fd = socket(family, SOCK_STREAM, 0);
+	if (fd < 0) {
+		fprintf(stderr, "resolver: TLS socket: %s\n", strerror(errno));
+		return -1;
+	}
+
+	struct timeval tv = { .tv_sec = RESOLVER_TIMEOUT_SEC, .tv_usec = 0 };
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0
+	    || setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+		fprintf(stderr, "resolver: TLS setsockopt: %s\n",
+		        strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	if (connect(fd, upstream, upstream_len) < 0) {
+		fprintf(stderr, "resolver: TLS connect: %s\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	ssl = SSL_new(client_tls_ctx);
+	if (ssl == NULL || SSL_set_fd(ssl, fd) != 1) {
+		fprintf(stderr, "resolver: TLS SSL_new/set_fd failed\n");
+		if (ssl != NULL)
+			SSL_free(ssl);
+		close(fd);
+		return -1;
+	}
+
+	if (SSL_connect(ssl) <= 0) {
+		fprintf(stderr, "resolver: TLS handshake failed: %s\n",
+		        ERR_reason_error_string(ERR_get_error()));
+		SSL_free(ssl);
+		close(fd);
+		return -1;
+	}
+
+	if (query_len > UINT16_MAX) {
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+		close(fd);
+		return -1;
+	}
+	len_buf[0] = (uint8_t)(query_len >> 8);
+	len_buf[1] = (uint8_t)query_len;
+
+	if (ssl_writen(ssl, len_buf, 2) < 0
+	    || ssl_writen(ssl, query, query_len) < 0) {
+		fprintf(stderr, "resolver: TLS send: %s\n", strerror(errno));
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+		close(fd);
+		return -1;
+	}
+
+	if (ssl_readn(ssl, len_buf, 2) < 0) {
+		fprintf(stderr, "resolver: TLS recv length: %s\n",
+		        strerror(errno));
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+		close(fd);
+		return -1;
+	}
+
+	size_t resp_size = (size_t)(((uint16_t)len_buf[0] << 8) | len_buf[1]);
+	if (resp_size < DNS_HEADER_SIZE || resp_size > response_size) {
+		fprintf(stderr, "resolver: TLS bad response length: %zu\n",
+		        resp_size);
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+		close(fd);
+		return -1;
+	}
+
+	if (ssl_readn(ssl, response, resp_size) < 0) {
+		fprintf(stderr, "resolver: TLS recv body: %s\n",
+		        strerror(errno));
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+		close(fd);
+		return -1;
+	}
+
+	SSL_shutdown(ssl);
+	SSL_free(ssl);
+	close(fd);
+
+	uint16_t got_id = (uint16_t)(((uint16_t)response[0] << 8) | response[1]);
+	if (got_id != upstream_id) {
+		fprintf(stderr, "resolver: TLS response ID mismatch\n");
+		return -1;
+	}
+
+	response[0]   = orig_query[0];
+	response[1]   = orig_query[1];
+
+	*response_len = resp_size;
+	return 0;
+}
+
 /*
  * Forward query to upstream over TCP and return the response.
  * query[] already has the upstream ID substituted and may have 0x20
@@ -258,6 +427,7 @@ forward_tcp(const struct sockaddr *upstream, socklen_t upstream_len,
 
 int
 resolver_forward(const char *upstream_addr, uint16_t upstream_port,
+                 bool           upstream_tls,
                  const uint8_t *query, size_t query_len,
                  uint8_t *response, size_t response_size,
                  size_t *response_len)
@@ -311,6 +481,13 @@ resolver_forward(const char *upstream_addr, uint16_t upstream_port,
 		        upstream_addr);
 		return -1;
 	}
+
+	/* DoT: bypass UDP entirely and go directly to TLS */
+	if (upstream_tls)
+		return forward_tls((const struct sockaddr *)&ss, ss_len, family,
+		                   forwarded_query, query_len,
+		                   upstream_id, query,
+		                   response, response_size, response_len);
 
 	int fd = socket(family, SOCK_DGRAM, 0);
 	if (fd < 0) {
