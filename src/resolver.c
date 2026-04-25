@@ -8,13 +8,17 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include "dns.h"
 #include "random.h"
@@ -31,6 +35,24 @@ enum {
 static SSL_CTX       *client_tls_ctx;
 static pthread_once_t client_tls_once = PTHREAD_ONCE_INIT;
 
+/* Configured via resolver_set_tls_config(); read-only after init. */
+static char           tls_ca_file[256];
+static char           tls_auth_name[256];
+static bool           tls_insecure;
+
+void
+resolver_set_tls_config(const char *ca_file, const char *auth_name,
+                        bool insecure)
+{
+	tls_ca_file[0]   = '\0';
+	tls_auth_name[0] = '\0';
+	if (ca_file != NULL)
+		snprintf(tls_ca_file, sizeof(tls_ca_file), "%s", ca_file);
+	if (auth_name != NULL)
+		snprintf(tls_auth_name, sizeof(tls_auth_name), "%s", auth_name);
+	tls_insecure = insecure;
+}
+
 static void
 init_client_tls_ctx(void)
 {
@@ -38,7 +60,27 @@ init_client_tls_ctx(void)
 	if (ctx == NULL)
 		return;
 	SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+
+	if (tls_insecure) {
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+	} else {
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+		if (tls_ca_file[0] != '\0') {
+			if (SSL_CTX_load_verify_locations(ctx, tls_ca_file, NULL)
+			    != 1) {
+				fprintf(stderr,
+				        "resolver: failed to load CA file %s\n",
+				        tls_ca_file);
+				SSL_CTX_free(ctx);
+				return;
+			}
+		} else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+			fprintf(stderr,
+			        "resolver: failed to load default CA paths\n");
+			SSL_CTX_free(ctx);
+			return;
+		}
+	}
 	client_tls_ctx = ctx;
 }
 
@@ -217,20 +259,29 @@ ssl_writen(SSL *ssl, const uint8_t *buf, size_t len)
 	return 0;
 }
 
+static void
+tls_close(SSL *ssl, int fd)
+{
+	if (ssl != NULL) {
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+	}
+	if (fd >= 0)
+		close(fd);
+}
+
 /*
- * Forward query to upstream over DNS-over-TLS (RFC 7858).
- * Uses TCP with a TLS layer; same length-prefix framing as DNS-over-TCP.
+ * Open a verified TLS connection to upstream.  hostname is used as the
+ * SNI/verify name when --tls-auth-name is unset.  On success returns 0
+ * with *out_fd and *out_ssl populated; caller frees via tls_close().
  */
 static int
-forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
+tls_connect(const struct sockaddr *upstream, socklen_t upstream_len,
             int family, const char *hostname,
-            const uint8_t *query, size_t query_len,
-            uint16_t upstream_id, const uint8_t *orig_query,
-            uint8_t *response, size_t response_size,
-            size_t *response_len)
+            int *out_fd, SSL **out_ssl)
 {
-	uint8_t len_buf[2];
-	SSL    *ssl = NULL;
+	*out_fd  = -1;
+	*out_ssl = NULL;
 
 	pthread_once(&client_tls_once, init_client_tls_ctx);
 	if (client_tls_ctx == NULL) {
@@ -259,7 +310,7 @@ forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
 		return -1;
 	}
 
-	ssl = SSL_new(client_tls_ctx);
+	SSL *ssl = SSL_new(client_tls_ctx);
 	if (ssl == NULL || SSL_set_fd(ssl, fd) != 1) {
 		fprintf(stderr, "resolver: TLS SSL_new/set_fd failed\n");
 		if (ssl != NULL)
@@ -268,21 +319,66 @@ forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
 		return -1;
 	}
 
-	if (hostname != NULL && hostname[0] != '\0')
-		SSL_set_tlsext_host_name(ssl, hostname);
+	const char *verify_name = tls_auth_name[0] != '\0' ? tls_auth_name : (hostname != NULL && hostname[0] != '\0') ? hostname :
+	                                                                                                                 NULL;
+
+	if (verify_name != NULL)
+		SSL_set_tlsext_host_name(ssl, verify_name);
+
+	if (!tls_insecure) {
+		if (verify_name == NULL) {
+			fprintf(stderr,
+			        "resolver: TLS verification requires a hostname "
+			        "or --tls-auth-name (use --insecure to skip)\n");
+			tls_close(ssl, fd);
+			return -1;
+		}
+		SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+		if (SSL_set1_host(ssl, verify_name) != 1) {
+			fprintf(stderr,
+			        "resolver: SSL_set1_host failed for %s\n",
+			        verify_name);
+			tls_close(ssl, fd);
+			return -1;
+		}
+	}
 
 	if (SSL_connect(ssl) <= 0) {
-		fprintf(stderr, "resolver: TLS handshake failed: %s\n",
-		        ERR_reason_error_string(ERR_get_error()));
-		SSL_free(ssl);
-		close(fd);
+		long verify_rc = SSL_get_verify_result(ssl);
+		fprintf(stderr,
+		        "resolver: TLS handshake failed: %s (verify=%ld %s)\n",
+		        ERR_reason_error_string(ERR_get_error()),
+		        verify_rc, X509_verify_cert_error_string(verify_rc));
+		tls_close(ssl, fd);
 		return -1;
 	}
 
+	*out_fd  = fd;
+	*out_ssl = ssl;
+	return 0;
+}
+
+/*
+ * Forward query to upstream over DNS-over-TLS (RFC 7858).
+ * Uses TCP with a TLS layer; same length-prefix framing as DNS-over-TCP.
+ */
+static int
+forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
+            int family, const char *hostname,
+            const uint8_t *query, size_t query_len,
+            uint16_t upstream_id, const uint8_t *orig_query,
+            uint8_t *response, size_t response_size,
+            size_t *response_len)
+{
+	uint8_t len_buf[2];
+	SSL    *ssl = NULL;
+	int     fd  = -1;
+
+	if (tls_connect(upstream, upstream_len, family, hostname, &fd, &ssl) < 0)
+		return -1;
+
 	if (query_len > UINT16_MAX) {
-		SSL_shutdown(ssl);
-		SSL_free(ssl);
-		close(fd);
+		tls_close(ssl, fd);
 		return -1;
 	}
 	len_buf[0] = (uint8_t)(query_len >> 8);
@@ -291,18 +387,14 @@ forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
 	if (ssl_writen(ssl, len_buf, 2) < 0
 	    || ssl_writen(ssl, query, query_len) < 0) {
 		fprintf(stderr, "resolver: TLS send: %s\n", strerror(errno));
-		SSL_shutdown(ssl);
-		SSL_free(ssl);
-		close(fd);
+		tls_close(ssl, fd);
 		return -1;
 	}
 
 	if (ssl_readn(ssl, len_buf, 2) < 0) {
 		fprintf(stderr, "resolver: TLS recv length: %s\n",
 		        strerror(errno));
-		SSL_shutdown(ssl);
-		SSL_free(ssl);
-		close(fd);
+		tls_close(ssl, fd);
 		return -1;
 	}
 
@@ -310,24 +402,18 @@ forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
 	if (resp_size < DNS_HEADER_SIZE || resp_size > response_size) {
 		fprintf(stderr, "resolver: TLS bad response length: %zu\n",
 		        resp_size);
-		SSL_shutdown(ssl);
-		SSL_free(ssl);
-		close(fd);
+		tls_close(ssl, fd);
 		return -1;
 	}
 
 	if (ssl_readn(ssl, response, resp_size) < 0) {
 		fprintf(stderr, "resolver: TLS recv body: %s\n",
 		        strerror(errno));
-		SSL_shutdown(ssl);
-		SSL_free(ssl);
-		close(fd);
+		tls_close(ssl, fd);
 		return -1;
 	}
 
-	SSL_shutdown(ssl);
-	SSL_free(ssl);
-	close(fd);
+	tls_close(ssl, fd);
 
 	uint16_t got_id = (uint16_t)(((uint16_t)response[0] << 8) | response[1]);
 	if (got_id != upstream_id) {
@@ -339,6 +425,183 @@ forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
 	response[1]   = orig_query[1];
 
 	*response_len = resp_size;
+	return 0;
+}
+
+/*
+ * Read until "\r\n\r\n" or buffer full.  Returns 0 on success and the
+ * total header byte count (including the terminating CRLFCRLF) in
+ * *header_len.  Buffer is NUL-terminated on success.
+ */
+static int
+read_http_headers(SSL *ssl, char *buf, size_t buf_size, size_t *header_len)
+{
+	size_t pos = 0;
+
+	while (pos + 1 < buf_size) {
+		int n = SSL_read(ssl, buf + pos, 1);
+		if (n <= 0)
+			return -1;
+		pos++;
+		if (pos >= 4 && buf[pos - 4] == '\r' && buf[pos - 3] == '\n' && buf[pos - 2] == '\r' && buf[pos - 1] == '\n') {
+			buf[pos]    = '\0';
+			*header_len = pos;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static int
+http_parse_status(const char *headers, int *status_code)
+{
+	if (strncmp(headers, "HTTP/1.", 7) != 0)
+		return -1;
+	const char *space = strchr(headers, ' ');
+	if (space == NULL)
+		return -1;
+	*status_code = atoi(space + 1);
+	return 0;
+}
+
+static const char *
+http_find_header(const char *headers, const char *name)
+{
+	size_t      name_len = strlen(name);
+	const char *p        = strchr(headers, '\n');
+
+	if (p == NULL)
+		return NULL;
+	p++; /* skip past status line */
+
+	while (*p != '\0') {
+		if (*p == '\r' && p[1] == '\n')
+			return NULL;
+		if (strncasecmp(p, name, name_len) == 0 && p[name_len] == ':') {
+			const char *v = p + name_len + 1;
+			while (*v == ' ' || *v == '\t')
+				v++;
+			return v;
+		}
+		const char *eol = strstr(p, "\r\n");
+		if (eol == NULL)
+			return NULL;
+		p = eol + 2;
+	}
+	return NULL;
+}
+
+/*
+ * Forward query to upstream over DNS-over-HTTPS (RFC 8484).  Uses POST
+ * with application/dns-message.  hostname is required (Host header +
+ * SNI/verify) unless --tls-auth-name is configured.
+ */
+static int
+forward_doh(const struct sockaddr *upstream, socklen_t upstream_len,
+            int family, const char *hostname, const char *doh_path,
+            const uint8_t *query, size_t query_len,
+            uint16_t upstream_id, const uint8_t *orig_query,
+            uint8_t *response, size_t response_size,
+            size_t *response_len)
+{
+	SSL        *ssl  = NULL;
+	int         fd   = -1;
+	const char *path = (doh_path != NULL && doh_path[0] != '\0') ? doh_path : "/dns-query";
+	const char *host = (hostname != NULL && hostname[0] != '\0') ? hostname : (tls_auth_name[0] != '\0' ? tls_auth_name : NULL);
+
+	if (host == NULL) {
+		fprintf(stderr,
+		        "resolver: DoH requires a hostname or "
+		        "--tls-auth-name\n");
+		return -1;
+	}
+
+	if (tls_connect(upstream, upstream_len, family, host, &fd, &ssl) < 0)
+		return -1;
+
+	char header_buf[1024];
+	int  hn = snprintf(header_buf, sizeof(header_buf),
+	                   "POST %s HTTP/1.1\r\n"
+	                   "Host: %s\r\n"
+	                   "User-Agent: dnska/0.1\r\n"
+	                   "Accept: application/dns-message\r\n"
+	                   "Content-Type: application/dns-message\r\n"
+	                   "Content-Length: %zu\r\n"
+	                   "Connection: close\r\n\r\n",
+	                   path, host, query_len);
+	if (hn < 0 || (size_t)hn >= sizeof(header_buf)) {
+		fprintf(stderr, "resolver: DoH header too large\n");
+		tls_close(ssl, fd);
+		return -1;
+	}
+
+	if (ssl_writen(ssl, (const uint8_t *)header_buf, (size_t)hn) < 0
+	    || ssl_writen(ssl, query, query_len) < 0) {
+		fprintf(stderr, "resolver: DoH send failed\n");
+		tls_close(ssl, fd);
+		return -1;
+	}
+
+	char   resp_headers[4096];
+	size_t header_len = 0;
+	if (read_http_headers(ssl, resp_headers, sizeof(resp_headers),
+	                      &header_len)
+	    < 0) {
+		fprintf(stderr, "resolver: DoH read headers failed\n");
+		tls_close(ssl, fd);
+		return -1;
+	}
+
+	int status = 0;
+	if (http_parse_status(resp_headers, &status) < 0 || status != 200) {
+		fprintf(stderr, "resolver: DoH HTTP status %d\n", status);
+		tls_close(ssl, fd);
+		return -1;
+	}
+
+	const char *ctype = http_find_header(resp_headers, "Content-Type");
+	if (ctype == NULL
+	    || strncasecmp(ctype, "application/dns-message", 23) != 0) {
+		fprintf(stderr,
+		        "resolver: DoH bad Content-Type (need application/"
+		        "dns-message)\n");
+		tls_close(ssl, fd);
+		return -1;
+	}
+
+	const char *clen = http_find_header(resp_headers, "Content-Length");
+	if (clen == NULL) {
+		fprintf(stderr, "resolver: DoH missing Content-Length\n");
+		tls_close(ssl, fd);
+		return -1;
+	}
+	size_t content_length = (size_t)strtoul(clen, NULL, 10);
+	if (content_length < DNS_HEADER_SIZE
+	    || content_length > response_size) {
+		fprintf(stderr, "resolver: DoH bad body length: %zu\n",
+		        content_length);
+		tls_close(ssl, fd);
+		return -1;
+	}
+
+	if (ssl_readn(ssl, response, content_length) < 0) {
+		fprintf(stderr, "resolver: DoH read body failed\n");
+		tls_close(ssl, fd);
+		return -1;
+	}
+
+	tls_close(ssl, fd);
+
+	uint16_t got_id = (uint16_t)(((uint16_t)response[0] << 8) | response[1]);
+	if (got_id != upstream_id) {
+		fprintf(stderr, "resolver: DoH response ID mismatch\n");
+		return -1;
+	}
+
+	response[0]   = orig_query[0];
+	response[1]   = orig_query[1];
+
+	*response_len = content_length;
 	return 0;
 }
 
@@ -428,12 +691,14 @@ forward_tcp(const struct sockaddr *upstream, socklen_t upstream_len,
 	return 0;
 }
 
-int
-resolver_forward(const char *upstream_addr, uint16_t upstream_port,
-                 bool upstream_tls, const char *upstream_hostname,
-                 const uint8_t *query, size_t query_len,
-                 uint8_t *response, size_t response_size,
-                 size_t *response_len)
+static int
+forward_one_address(const char *upstream_addr, uint16_t upstream_port,
+                    bool upstream_tls, bool upstream_doh,
+                    const char    *doh_path,
+                    const char    *upstream_hostname,
+                    const uint8_t *query, size_t query_len,
+                    uint8_t *response, size_t response_size,
+                    size_t *response_len)
 {
 	struct sockaddr_storage ss;
 	socklen_t               ss_len;
@@ -457,7 +722,7 @@ resolver_forward(const char *upstream_addr, uint16_t upstream_port,
 	forwarded_query[0]       = (uint8_t)(upstream_id >> 8);
 	forwarded_query[1]       = (uint8_t)upstream_id;
 	uint16_t forwarded_flags = wire_read_u16(query + 2)
-	                           & (DNS_FLAGS_OPCODE_MASK | DNS_FLAG_RD);
+	                           & (DNS_FLAGS_OPCODE_MASK | DNS_FLAG_RD | DNS_FLAG_AD | DNS_FLAG_CD);
 	forwarded_query[2]       = (uint8_t)(forwarded_flags >> 8);
 	forwarded_query[3]       = (uint8_t)forwarded_flags;
 
@@ -465,6 +730,26 @@ resolver_forward(const char *upstream_addr, uint16_t upstream_port,
 	if (wire_read_u16(forwarded_query + 4) >= 1)
 		randomize_qname_case(forwarded_query, query_len,
 		                     DNS_HEADER_SIZE);
+
+	/*
+	 * Detect whether the client asked with EDNS.  Always force DO=1
+	 * on the upstream copy so we can pass DNSSEC records through; if
+	 * the client was non-EDNS, strip the OPT from the upstream reply
+	 * before returning (RFC 6891 §6.1.1).
+	 */
+	size_t client_opt_off   = 0;
+	size_t client_opt_total = 0;
+	int    client_opt_rc    = dns_find_opt(query, query_len,
+	                                       &client_opt_off, &client_opt_total);
+	bool   client_had_opt   = (client_opt_rc == 0);
+
+	size_t forwarded_len    = dns_set_outbound_edns(
+	        forwarded_query, query_len, sizeof(forwarded_query));
+	if (forwarded_len == 0) {
+		fprintf(stderr, "resolver: failed to set outbound EDNS\n");
+		return -1;
+	}
+	query_len               = forwarded_len;
 
 	struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
 	struct sockaddr_in  *a4 = (struct sockaddr_in *)&ss;
@@ -485,13 +770,31 @@ resolver_forward(const char *upstream_addr, uint16_t upstream_port,
 		return -1;
 	}
 
+	/* DoH: HTTP POST over TLS */
+	if (upstream_doh) {
+		int rc = forward_doh((const struct sockaddr *)&ss, ss_len, family,
+		                     upstream_hostname, doh_path,
+		                     forwarded_query, query_len,
+		                     upstream_id, query,
+		                     response, response_size, response_len);
+		if (rc == 0 && !client_had_opt)
+			*response_len = dns_strip_response_opt(response,
+			                                       *response_len);
+		return rc;
+	}
+
 	/* DoT: bypass UDP entirely and go directly to TLS */
-	if (upstream_tls)
-		return forward_tls((const struct sockaddr *)&ss, ss_len, family,
-		                   upstream_hostname,
-		                   forwarded_query, query_len,
-		                   upstream_id, query,
-		                   response, response_size, response_len);
+	if (upstream_tls) {
+		int rc = forward_tls((const struct sockaddr *)&ss, ss_len, family,
+		                     upstream_hostname,
+		                     forwarded_query, query_len,
+		                     upstream_id, query,
+		                     response, response_size, response_len);
+		if (rc == 0 && !client_had_opt)
+			*response_len = dns_strip_response_opt(response,
+			                                       *response_len);
+		return rc;
+	}
 
 	int fd = socket(family, SOCK_DGRAM, 0);
 	if (fd < 0) {
@@ -586,15 +889,56 @@ resolver_forward(const char *upstream_addr, uint16_t upstream_port,
 	/* RFC 7766 §6.2.1: retry over TCP when upstream signals truncation */
 	if ((wire_read_u16(response + 2) & DNS_FLAG_TC) != 0) {
 		fprintf(stderr, "resolver: upstream truncated, retrying TCP\n");
-		return forward_tcp((const struct sockaddr *)&ss, ss_len, family,
-		                   forwarded_query, query_len,
-		                   upstream_id, query,
-		                   response, response_size, response_len);
+		int rc = forward_tcp((const struct sockaddr *)&ss, ss_len, family,
+		                     forwarded_query, query_len,
+		                     upstream_id, query,
+		                     response, response_size, response_len);
+		if (rc == 0 && !client_had_opt)
+			*response_len = dns_strip_response_opt(response,
+			                                       *response_len);
+		return rc;
 	}
 
 	response[0]   = query[0];
 	response[1]   = query[1];
 
 	*response_len = (size_t)recvd;
+
+	if (!client_had_opt)
+		*response_len = dns_strip_response_opt(response, *response_len);
+
 	return 0;
+}
+
+int
+resolver_forward(const char upstream_addrs[][INET6_ADDRSTRLEN],
+                 size_t     upstream_addr_count,
+                 uint16_t upstream_port, bool upstream_tls,
+                 bool upstream_doh, const char *doh_path,
+                 const char    *upstream_hostname,
+                 const uint8_t *query, size_t query_len,
+                 uint8_t *response, size_t response_size,
+                 size_t *response_len)
+{
+	if (upstream_addr_count == 0) {
+		fprintf(stderr, "resolver: no upstream addresses\n");
+		return -1;
+	}
+
+	for (size_t i = 0; i < upstream_addr_count; i++) {
+		int rc = forward_one_address(upstream_addrs[i], upstream_port,
+		                             upstream_tls, upstream_doh,
+		                             doh_path, upstream_hostname,
+		                             query, query_len,
+		                             response, response_size,
+		                             response_len);
+		if (rc == 0)
+			return 0;
+		if (i + 1 < upstream_addr_count)
+			fprintf(stderr,
+			        "resolver: upstream %s failed, trying %s\n",
+			        upstream_addrs[i], upstream_addrs[i + 1]);
+	}
+
+	return -1;
 }

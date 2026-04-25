@@ -168,10 +168,12 @@ test_id_randomized_flags_stripped(void)
 	query_len = make_query(query, 0x1234,
 	                       DNS_FLAG_RD | DNS_FLAG_AD | DNS_FLAG_CD,
 	                       "example.com");
-	rc        = resolver_forward("127.0.0.1", ntohs(upstream_addr.sin_port),
-	                             false, NULL,
-	                             query, query_len,
-	                             response, sizeof(response), &response_len);
+
+	char addrs[1][INET6_ADDRSTRLEN];
+	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
+	rc = resolver_forward(addrs, 1, ntohs(upstream_addr.sin_port),
+	                      false, false, NULL, NULL, query, query_len,
+	                      response, sizeof(response), &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture.fd);
@@ -184,8 +186,9 @@ test_id_randomized_flags_stripped(void)
 	/* Upstream must have seen a different (randomized) ID */
 	TEST_CHECK(fixture.observed_id != 0x1234);
 
-	/* Upstream must see only RD, not AD or CD */
-	TEST_EXPECT_INT_EQ(fixture.observed_flags, DNS_FLAG_RD);
+	/* Upstream must see RD and DNSSEC pass-through bits (AD, CD) */
+	TEST_EXPECT_INT_EQ(fixture.observed_flags,
+	                   DNS_FLAG_RD | DNS_FLAG_AD | DNS_FLAG_CD);
 
 	/* Source port must be random and ≥ 1024 */
 	TEST_CHECK(fixture.client_port >= 1024);
@@ -266,10 +269,12 @@ test_0x20_randomization_uppercase_present(void)
 
 	/* "example.com" has 10 alphabetic bytes: P(all lower) = 1/1024 */
 	query_len = make_query(query, 0xABCD, DNS_FLAG_RD, "example.com");
-	resolver_forward("127.0.0.1", ntohs(upstream_addr.sin_port),
-	                 false, NULL,
-	                 query, query_len,
-	                 response, sizeof(response), &response_len);
+
+	char addrs[1][INET6_ADDRSTRLEN];
+	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
+	resolver_forward(addrs, 1, ntohs(upstream_addr.sin_port), false, false,
+	                 NULL, NULL, query, query_len, response,
+	                 sizeof(response), &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture.fd);
@@ -474,10 +479,12 @@ test_tcp_fallback_on_truncation(void)
 	TEST_CHECK(pthread_create(&thread, NULL, serve_tc_then_tcp, &fx) == 0);
 
 	query_len = make_query(query, 0x1234, DNS_FLAG_RD, "example.com");
-	rc        = resolver_forward("127.0.0.1", fx.port,
-	                             false, NULL,
-	                             query, query_len,
-	                             response, sizeof(response), &response_len);
+
+	char addrs[1][INET6_ADDRSTRLEN];
+	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
+	rc = resolver_forward(addrs, 1, fx.port, false, false, NULL, NULL,
+	                      query, query_len, response, sizeof(response),
+	                      &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fx.udp_fd);
@@ -499,12 +506,67 @@ test_tcp_fallback_on_truncation(void)
 	TEST_EXPECT_SIZE_EQ(response_len, fx.full_response_len);
 }
 
+/* --- multi-address upstream failover --- */
+
+static void
+test_multi_addr_failover_skips_dead_first(void)
+{
+	struct sockaddr_in      upstream_addr;
+	socklen_t               upstream_len = sizeof(upstream_addr);
+	struct upstream_fixture fixture;
+	pthread_t               thread;
+	uint8_t                 query[DNS_MAX_MSG_SIZE];
+	uint8_t                 response[DNS_MAX_MSG_SIZE];
+	size_t                  query_len;
+	size_t                  response_len = 0;
+	int                     rc;
+
+	memset(&fixture, 0, sizeof(fixture));
+	fixture.fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fixture.fd < 0 && (errno == EPERM || errno == EACCES))
+		TEST_SKIP("resolver tests skipped: UDP sockets unavailable");
+	TEST_CHECK(fixture.fd >= 0);
+
+	memset(&upstream_addr, 0, sizeof(upstream_addr));
+	upstream_addr.sin_family      = AF_INET;
+	upstream_addr.sin_port        = 0;
+	upstream_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	TEST_CHECK(bind(fixture.fd, (struct sockaddr *)&upstream_addr,
+	                sizeof(upstream_addr))
+	           == 0);
+	TEST_CHECK(getsockname(fixture.fd, (struct sockaddr *)&upstream_addr,
+	                       &upstream_len)
+	           == 0);
+	TEST_CHECK(pthread_create(&thread, NULL, serve_upstream, &fixture)
+	           == 0);
+
+	query_len = make_query(query, 0x1234, DNS_FLAG_RD, "example.com");
+
+	/* First addr is unrouted ENETUNREACH-style; second is the live mock. */
+	char addrs[2][INET6_ADDRSTRLEN];
+	snprintf(addrs[0], INET6_ADDRSTRLEN, "192.0.2.1"); /* TEST-NET-1 */
+	snprintf(addrs[1], INET6_ADDRSTRLEN, "127.0.0.1");
+
+	rc = resolver_forward(addrs, 2, ntohs(upstream_addr.sin_port), false,
+	                      false, NULL, NULL, query, query_len, response,
+	                      sizeof(response), &response_len);
+
+	TEST_CHECK(pthread_join(thread, NULL) == 0);
+	close(fixture.fd);
+
+	/* Failover must succeed and the live mock must have observed traffic */
+	TEST_EXPECT_INT_EQ(rc, 0);
+	TEST_CHECK(fixture.observed_id != 0);
+	TEST_EXPECT_INT_EQ(wire_read_u16(response), 0x1234);
+}
+
 int
 main(void)
 {
 	test_id_randomized_flags_stripped();
 	test_0x20_randomization_uppercase_present();
 	test_tcp_fallback_on_truncation();
+	test_multi_addr_failover_skips_dead_first();
 
 	puts("resolver tests passed");
 	return 0;

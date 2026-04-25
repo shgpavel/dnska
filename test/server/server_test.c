@@ -177,6 +177,8 @@ start_test_server(struct test_server *ts, const char *upstream_addr,
 	cfg.upstream_port = (uint16_t)upstream_port;
 	snprintf(cfg.upstream_addr, sizeof(cfg.upstream_addr),
 	         "%s", upstream_addr);
+	snprintf(cfg.upstream_addrs[0], INET6_ADDRSTRLEN, "%s", upstream_addr);
+	cfg.upstream_addr_count = 1;
 
 	memset(ts, 0, sizeof(*ts));
 	ts->udp_port = -1;
@@ -941,6 +943,8 @@ start_dot_test_server(struct test_server *ts, const char *upstream_addr,
 	cfg.upstream_tls  = true;
 	snprintf(cfg.upstream_addr, sizeof(cfg.upstream_addr),
 	         "%s", upstream_addr);
+	snprintf(cfg.upstream_addrs[0], INET6_ADDRSTRLEN, "%s", upstream_addr);
+	cfg.upstream_addr_count = 1;
 
 	memset(ts, 0, sizeof(*ts));
 	ts->udp_port = -1;

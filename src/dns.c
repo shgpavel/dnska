@@ -297,6 +297,114 @@ dns_response_matches_query(const struct dns_message *query,
 	return true;
 }
 
+int
+dns_find_opt(const uint8_t *buf, size_t len,
+             size_t *opt_offset, size_t *opt_total_len)
+{
+	if (len < DNS_HEADER_SIZE)
+		return -1;
+
+	uint16_t qdcount = wire_read_u16(buf + 4);
+	uint16_t ancount = wire_read_u16(buf + 6);
+	uint16_t nscount = wire_read_u16(buf + 8);
+	uint16_t arcount = wire_read_u16(buf + 10);
+	size_t   pos     = DNS_HEADER_SIZE;
+
+	for (uint16_t i = 0; i < qdcount; i++) {
+		int n = wire_skip_name(buf, len, pos);
+		if (n < 0)
+			return -1;
+		pos += (size_t)n + 4;
+		if (pos > len)
+			return -1;
+	}
+
+	uint32_t skip = (uint32_t)ancount + nscount;
+	for (uint32_t i = 0; i < skip; i++) {
+		struct dns_rr_view rr;
+		if (parse_rr_view(&rr, buf, len, pos) < 0)
+			return -1;
+		pos = rr.next_offset;
+	}
+
+	for (uint16_t i = 0; i < arcount; i++) {
+		size_t             rr_start = pos;
+		struct dns_rr_view rr;
+		if (parse_rr_view(&rr, buf, len, pos) < 0)
+			return -1;
+		if (rr.type == DNS_TYPE_OPT) {
+			*opt_offset    = rr_start;
+			*opt_total_len = rr.next_offset - rr_start;
+			return 0;
+		}
+		pos = rr.next_offset;
+	}
+
+	return 1;
+}
+
+size_t
+dns_set_outbound_edns(uint8_t *buf, size_t len, size_t max_size)
+{
+	size_t opt_off   = 0;
+	size_t opt_total = 0;
+	int    rc        = dns_find_opt(buf, len, &opt_off, &opt_total);
+
+	if (rc < 0)
+		return 0;
+
+	if (rc == 0) {
+		int n = wire_skip_name(buf, len, opt_off);
+		if (n < 0)
+			return 0;
+		size_t ttl_off = opt_off + (size_t)n + 4;
+		if (ttl_off + 4 > len)
+			return 0;
+		buf[ttl_off + 2] |= 0x80;
+		return len;
+	}
+
+	static const uint8_t opt_rr[11] = {
+		0x00,
+		0x00,
+		DNS_TYPE_OPT,
+		0x04,
+		0xD0,
+		0x00,
+		0x00,
+		0x80,
+		0x00,
+		0x00,
+		0x00,
+	};
+	if (len + sizeof(opt_rr) > max_size)
+		return 0;
+
+	memcpy(buf + len, opt_rr, sizeof(opt_rr));
+	wire_write_u16(buf + 10, (uint16_t)(wire_read_u16(buf + 10) + 1));
+	return len + sizeof(opt_rr);
+}
+
+size_t
+dns_strip_response_opt(uint8_t *buf, size_t len)
+{
+	size_t opt_off   = 0;
+	size_t opt_total = 0;
+	int    rc        = dns_find_opt(buf, len, &opt_off, &opt_total);
+
+	if (rc != 0 || opt_total == 0 || opt_off + opt_total > len)
+		return len;
+
+	memmove(buf + opt_off, buf + opt_off + opt_total,
+	        len - opt_off - opt_total);
+
+	uint16_t arcount = wire_read_u16(buf + 10);
+	if (arcount > 0)
+		wire_write_u16(buf + 10, (uint16_t)(arcount - 1));
+
+	return len - opt_total;
+}
+
 const char *
 dns_type_str(uint16_t type, char *buf, size_t buf_len)
 {

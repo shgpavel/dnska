@@ -66,9 +66,13 @@ question_wire_len_or_zero(const uint8_t *query, size_t query_len)
 
 static size_t
 make_error_response(const uint8_t *query, size_t query_len, size_t qd_wire_len,
-                    uint8_t rcode, uint8_t *resp, size_t resp_size)
+                    uint8_t rcode, uint16_t client_udp_size,
+                    uint8_t *resp, size_t resp_size)
 {
-	size_t resp_len = DNS_HEADER_SIZE + qd_wire_len;
+	enum { OPT_WIRE_LEN = 11 };
+	bool   want_opt = client_udp_size != 0;
+	size_t resp_len = DNS_HEADER_SIZE + qd_wire_len + (want_opt ? OPT_WIRE_LEN : 0);
+
 	if (query_len < DNS_HEADER_SIZE || resp_len > resp_size)
 		return 0;
 
@@ -86,11 +90,26 @@ make_error_response(const uint8_t *query, size_t query_len, size_t qd_wire_len,
 	resp[8]    = 0;
 	resp[9]    = 0;
 	resp[10]   = 0;
-	resp[11]   = 0;
+	resp[11]   = want_opt ? 1 : 0;
 
 	if (qd_wire_len > 0)
 		memcpy(resp + DNS_HEADER_SIZE, query + DNS_HEADER_SIZE,
 		       qd_wire_len);
+
+	if (want_opt) {
+		size_t p  = DNS_HEADER_SIZE + qd_wire_len;
+		resp[p++] = 0x00;
+		resp[p++] = 0x00;
+		resp[p++] = DNS_TYPE_OPT;
+		resp[p++] = (uint8_t)(client_udp_size >> 8);
+		resp[p++] = (uint8_t)client_udp_size;
+		resp[p++] = 0x00;
+		resp[p++] = 0x00;
+		resp[p++] = 0x00;
+		resp[p++] = 0x00;
+		resp[p++] = 0x00;
+		resp[p++] = 0x00;
+	}
 
 	return resp_len;
 }
@@ -500,6 +519,7 @@ process_dns_query(struct query_task *task)
 		                                           task->query_len,
 		                                           qd_wire_len,
 		                                           DNS_RCODE_FORMERR,
+		                                           0,
 		                                           response,
 		                                           sizeof(response));
 
@@ -514,13 +534,15 @@ process_dns_query(struct query_task *task)
 	uint8_t opcode = (uint8_t)((msg.header.flags & DNS_FLAGS_OPCODE_MASK)
 	                           >> DNS_FLAGS_OPCODE_SHIFT);
 	if (opcode != DNS_OPCODE_QUERY) {
-		uint8_t response[DNS_MAX_MSG_SIZE];
-		size_t  response_len = make_error_response(task->query,
-		                                           task->query_len,
-		                                           msg.question_wire_len,
-		                                           DNS_RCODE_NOTIMP,
-		                                           response,
-		                                           sizeof(response));
+		uint8_t  response[DNS_MAX_MSG_SIZE];
+		uint16_t udp_size     = msg.has_edns ? (msg.cache_key.opt_udp_size > 0 ? msg.cache_key.opt_udp_size : 512) : 0;
+		size_t   response_len = make_error_response(task->query,
+		                                            task->query_len,
+		                                            msg.question_wire_len,
+		                                            DNS_RCODE_NOTIMP,
+		                                            udp_size,
+		                                            response,
+		                                            sizeof(response));
 
 		log_msg(LOG_WARN, "server: opcode %u from %s:%d -> NOTIMP\n",
 		        opcode, addr_buf, port);
@@ -584,15 +606,19 @@ process_dns_query(struct query_task *task)
 		                     sizeof(qtype_buf)),
 		        response_len);
 	} else {
-		int rc = resolver_forward(task->srv->config.upstream_addr,
+		int rc = resolver_forward(task->srv->config.upstream_addrs,
+		                          task->srv->config.upstream_addr_count,
 		                          task->srv->config.upstream_port,
 		                          task->srv->config.upstream_tls,
+		                          task->srv->config.upstream_doh,
+		                          task->srv->config.doh_path,
 		                          task->srv->config.upstream_hostname,
 		                          task->query, task->query_len,
 		                          response, sizeof(response),
 		                          &response_len);
 
 		if (rc < 0) {
+			uint16_t udp_size = msg.has_edns ? (msg.cache_key.opt_udp_size > 0 ? msg.cache_key.opt_udp_size : 512) : 0;
 			log_msg(LOG_WARN,
 			        "server: upstream failed for %s, "
 			        "sending SERVFAIL\n",
@@ -602,6 +628,7 @@ process_dns_query(struct query_task *task)
 			        task->query, task->query_len,
 			        msg.question_wire_len,
 			        DNS_RCODE_SERVFAIL,
+			        udp_size,
 			        response, sizeof(response));
 			if (response_len == 0)
 				return 0;
@@ -685,6 +712,22 @@ static void
 handle_query(struct query_task *task)
 {
 	if (task->conn_fd >= 0) {
+		/*
+		 * Set the idle timeout BEFORE the TLS handshake so a slow
+		 * peer cannot tie up a worker indefinitely (RFC 7858).
+		 */
+		struct timeval tv = { .tv_sec  = TCP_IDLE_TIMEOUT_SEC,
+			              .tv_usec = 0 };
+		if (setsockopt(task->conn_fd, SOL_SOCKET, SO_RCVTIMEO,
+		               &tv, sizeof(tv))
+		            < 0
+		    || setsockopt(task->conn_fd, SOL_SOCKET, SO_SNDTIMEO,
+		                  &tv, sizeof(tv))
+		               < 0) {
+			release_task_slot(task);
+			return;
+		}
+
 		/* DoT: perform TLS handshake before reading queries */
 		if (task->tls_ctx != NULL) {
 			SSL *ssl = SSL_new(task->tls_ctx);
@@ -705,18 +748,6 @@ handle_query(struct query_task *task)
 				return;
 			}
 			task->tls = ssl;
-		}
-
-		struct timeval tv = { .tv_sec  = TCP_IDLE_TIMEOUT_SEC,
-			              .tv_usec = 0 };
-		if (setsockopt(task->conn_fd, SOL_SOCKET, SO_RCVTIMEO,
-		               &tv, sizeof(tv))
-		            < 0
-		    || setsockopt(task->conn_fd, SOL_SOCKET, SO_SNDTIMEO,
-		                  &tv, sizeof(tv))
-		               < 0) {
-			release_task_slot(task);
-			return;
 		}
 
 		for (;;) {
@@ -1046,8 +1077,8 @@ make_selfsigned_cert(SSL_CTX *ctx)
 
 	name = X509_get_subject_name(cert);
 	ok   = X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-	                                   (const unsigned char *)"dnska",
-	                                   -1, -1, 0)
+	                                  (const unsigned char *)"dnska",
+	                                  -1, -1, 0)
 	               == 1
 	       && X509_set_issuer_name(cert, name) == 1
 	       && X509_sign(cert, pkey, EVP_sha256()) > 0
@@ -1108,7 +1139,7 @@ server_init(struct server *srv, const struct dns_config *cfg)
 		srv->query_tasks[i].tls         = NULL;
 	}
 
-	if (cfg->upstream_tls) {
+	if (cfg->upstream_tls && !cfg->upstream_doh) {
 		/* DoT listener (RFC 7858) */
 		SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
 		if (ctx == NULL) {
@@ -1240,14 +1271,19 @@ server_init(struct server *srv, const struct dns_config *cfg)
 		}
 	}
 
-	srv->running = 1;
-	log_msg(LOG_INFO, "server: listening on 0.0.0.0:%d (%s), "
-	                  "upstream %s:%d%s\n",
-	        srv->config.listen_port,
-	        srv->config.upstream_tls ? "DoT" : "UDP+TCP",
-	        srv->config.upstream_addr,
-	        srv->config.upstream_port,
-	        srv->config.upstream_tls ? " (DoT)" : "");
+	const char *listener_kind = (srv->config.upstream_tls
+	                             && !srv->config.upstream_doh) ?
+	                                    "DoT" :
+	                                    "UDP+TCP";
+	const char *upstream_kind = srv->config.upstream_doh ? " (DoH)" : srv->config.upstream_tls ? " (DoT)" :
+	                                                                                             "";
+
+	srv->running              = 1;
+	log_msg(LOG_INFO,
+	        "server: listening on 0.0.0.0:%d (%s), upstream %s:%d%s\n",
+	        srv->config.listen_port, listener_kind,
+	        srv->config.upstream_addr, srv->config.upstream_port,
+	        upstream_kind);
 	log_msg(LOG_WARN, "server: warning: no client ACL and only basic "
 	                  "per-source limits; not safe for public exposure\n");
 

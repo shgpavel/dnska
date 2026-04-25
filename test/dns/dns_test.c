@@ -98,11 +98,11 @@ test_parse_name_max_length(void)
 	size_t  consumed = 0;
 	size_t  pos      = 0;
 
-	pos        = append_fill_label(buf, pos, 63, 'a');
-	pos        = append_fill_label(buf, pos, 63, 'b');
-	pos        = append_fill_label(buf, pos, 63, 'c');
-	pos        = append_fill_label(buf, pos, 61, 'd');
-	buf[pos++] = 0;
+	pos              = append_fill_label(buf, pos, 63, 'a');
+	pos              = append_fill_label(buf, pos, 63, 'b');
+	pos              = append_fill_label(buf, pos, 63, 'c');
+	pos              = append_fill_label(buf, pos, 61, 'd');
+	buf[pos++]       = 0;
 
 	assert(pos == 255);
 	assert(dns_parse_name(buf, pos, 0, out, sizeof(out), &consumed) == 0);
@@ -160,13 +160,13 @@ test_parse_name_valid_pointer(void)
 	char    out[DNS_MAX_NAME_LEN + 1];
 	size_t  consumed = 0;
 
-	buf[0] = 3;
-	buf[1] = 'f';
-	buf[2] = 'o';
-	buf[3] = 'o';
-	buf[4] = 0;
-	buf[5] = 0xC0;
-	buf[6] = 0x00;
+	buf[0]           = 3;
+	buf[1]           = 'f';
+	buf[2]           = 'o';
+	buf[3]           = 'o';
+	buf[4]           = 0;
+	buf[5]           = 0xC0;
+	buf[6]           = 0x00;
 
 	assert(dns_parse_name(buf, 7, 5, out, sizeof(out), &consumed) == 0);
 	assert(consumed == 2);
@@ -200,12 +200,12 @@ test_multi_question_query(void)
 	struct dns_message msg;
 	size_t             pos = make_header(buf, 2, 0, 0, 0);
 
-	pos = append_name(buf, pos, "example.com");
+	pos                    = append_name(buf, pos, "example.com");
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos += 4;
 
-	pos = append_name(buf, pos, "example.net");
+	pos  = append_name(buf, pos, "example.net");
 	write_u16(buf + pos, DNS_TYPE_AAAA);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos += 4;
@@ -242,7 +242,7 @@ test_truncated_messages(void)
 	struct dns_message msg;
 	size_t             pos = make_header(buf, 1, 0, 0, 1);
 
-	pos = append_name(buf, pos, "example.com");
+	pos                    = append_name(buf, pos, "example.com");
 	assert(dns_parse_message(&msg, buf, pos) < 0);
 
 	pos = make_header(buf, 1, 0, 0, 1);
@@ -260,7 +260,7 @@ test_trailing_garbage_rejected(void)
 	struct dns_message msg;
 	size_t             pos = make_header(buf, 1, 0, 0, 0);
 
-	pos        = append_name(buf, pos, "example.com");
+	pos                    = append_name(buf, pos, "example.com");
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos        += 4;
@@ -299,7 +299,7 @@ test_query_with_answer_section_not_cacheable(void)
 
 	write_u16(buf, 0x1234);
 	write_u16(buf + 2, DNS_FLAG_RD);
-	pos        = append_name(buf, pos, "example.com");
+	pos = append_name(buf, pos, "example.com");
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos        += 4;
@@ -334,8 +334,8 @@ test_multiple_opt_records_not_cacheable(void)
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos += 4;
-	pos = append_opt_record(buf, pos, 1232, 0, NULL, 0);
-	pos = append_opt_record(buf, pos, 1232, 0, NULL, 0);
+	pos  = append_opt_record(buf, pos, 1232, 0, NULL, 0);
+	pos  = append_opt_record(buf, pos, 1232, 0, NULL, 0);
 
 	assert(dns_parse_message(&msg, buf, pos) == 0);
 	assert(!dns_query_is_cacheable(&msg));
@@ -348,7 +348,7 @@ test_opt_in_wrong_section(void)
 	struct dns_message msg;
 	size_t             pos = make_header(buf, 1, 1, 0, 0);
 
-	pos        = append_name(buf, pos, "example.com");
+	pos                    = append_name(buf, pos, "example.com");
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos        += 4;
@@ -380,7 +380,7 @@ test_edns_version_zero_sets_has_edns(void)
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos += 4;
-	pos = append_opt_record(buf, pos, 1232, 0x00000000UL, NULL, 0);
+	pos  = append_opt_record(buf, pos, 1232, 0x00000000UL, NULL, 0);
 
 	assert(dns_parse_message(&msg, buf, pos) == 0);
 	assert(msg.has_edns);
@@ -402,7 +402,7 @@ test_edns_version_nonzero_extracted(void)
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos += 4;
-	pos = append_opt_record(buf, pos, 1232, 0x00030000UL, NULL, 0);
+	pos  = append_opt_record(buf, pos, 1232, 0x00030000UL, NULL, 0);
 
 	assert(dns_parse_message(&msg, buf, pos) == 0);
 	assert(msg.has_edns);
@@ -425,13 +425,13 @@ test_edns_version_extracted_even_when_not_cacheable(void)
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos += 4;
 
-	pos = append_name(buf, pos, "example.net");
+	pos  = append_name(buf, pos, "example.net");
 	write_u16(buf + pos, DNS_TYPE_AAAA);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos += 4;
 
 	/* EDNS version = 1 in TTL bits 23-16 */
-	pos = append_opt_record(buf, pos, 1232, 0x00010000UL, NULL, 0);
+	pos  = append_opt_record(buf, pos, 1232, 0x00010000UL, NULL, 0);
 
 	assert(dns_parse_message(&msg, buf, pos) == 0);
 	assert(!dns_query_is_cacheable(&msg));
@@ -447,7 +447,7 @@ test_no_opt_has_edns_false(void)
 	struct dns_message msg;
 	size_t             pos = make_header(buf, 1, 0, 0, 0);
 
-	pos = append_name(buf, pos, "example.com");
+	pos                    = append_name(buf, pos, "example.com");
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	pos += 4;
@@ -467,19 +467,35 @@ test_opt_cookie_ignored_in_cache_key(void)
 	struct dns_message msg_a;
 	struct dns_message msg_b;
 	uint8_t            cookie_a[] = {
-		0x00, DNS_EDNS_OPTION_COOKIE,
-		0x00, 0x08,
-		0x01, 0x23, 0x45, 0x67,
-		0x89, 0xAB, 0xCD, 0xEF,
+		           0x00,
+		           DNS_EDNS_OPTION_COOKIE,
+		           0x00,
+		           0x08,
+		           0x01,
+		           0x23,
+		           0x45,
+		           0x67,
+		           0x89,
+		           0xAB,
+		           0xCD,
+		           0xEF,
 	};
-	uint8_t            cookie_b[] = {
-		0x00, DNS_EDNS_OPTION_COOKIE,
-		0x00, 0x08,
-		0x10, 0x32, 0x54, 0x76,
-		0x98, 0xBA, 0xDC, 0xFE,
+	uint8_t cookie_b[] = {
+		0x00,
+		DNS_EDNS_OPTION_COOKIE,
+		0x00,
+		0x08,
+		0x10,
+		0x32,
+		0x54,
+		0x76,
+		0x98,
+		0xBA,
+		0xDC,
+		0xFE,
 	};
-	size_t             pos_a;
-	size_t             pos_b;
+	size_t pos_a;
+	size_t pos_b;
 
 	pos_a = make_header(buf_a, 1, 0, 0, 1);
 	write_u16(buf_a, 0x1234);
@@ -488,18 +504,18 @@ test_opt_cookie_ignored_in_cache_key(void)
 	write_u16(buf_a + pos_a, DNS_TYPE_A);
 	write_u16(buf_a + pos_a + 2, DNS_CLASS_IN);
 	pos_a += 4;
-	pos_a = append_opt_record(buf_a, pos_a, 1232, 0, cookie_a,
-	                          sizeof(cookie_a));
+	pos_a  = append_opt_record(buf_a, pos_a, 1232, 0, cookie_a,
+	                           sizeof(cookie_a));
 
-	pos_b = make_header(buf_b, 1, 0, 0, 1);
+	pos_b  = make_header(buf_b, 1, 0, 0, 1);
 	write_u16(buf_b, 0x5678);
 	write_u16(buf_b + 2, DNS_FLAG_RD | DNS_FLAG_AD);
 	pos_b = append_name(buf_b, pos_b, "example.com");
 	write_u16(buf_b + pos_b, DNS_TYPE_A);
 	write_u16(buf_b + pos_b + 2, DNS_CLASS_IN);
 	pos_b += 4;
-	pos_b = append_opt_record(buf_b, pos_b, 1232, 0, cookie_b,
-	                          sizeof(cookie_b));
+	pos_b  = append_opt_record(buf_b, pos_b, 1232, 0, cookie_b,
+	                           sizeof(cookie_b));
 
 	assert(dns_parse_message(&msg_a, buf_a, pos_a) == 0);
 	assert(dns_parse_message(&msg_b, buf_b, pos_b) == 0);
@@ -523,17 +539,25 @@ test_opt_non_cookie_data_affects_cache_key(void)
 	struct dns_message msg_a;
 	struct dns_message msg_b;
 	uint8_t            opt_a[] = {
-		0x00, DNS_EDNS_OPTION_NSID,
-		0x00, 0x03,
-		'a', 'b', 'c',
+		           0x00,
+		           DNS_EDNS_OPTION_NSID,
+		           0x00,
+		           0x03,
+		           'a',
+		           'b',
+		           'c',
 	};
-	uint8_t            opt_b[] = {
-		0x00, DNS_EDNS_OPTION_NSID,
-		0x00, 0x03,
-		'a', 'b', 'd',
+	uint8_t opt_b[] = {
+		0x00,
+		DNS_EDNS_OPTION_NSID,
+		0x00,
+		0x03,
+		'a',
+		'b',
+		'd',
 	};
-	size_t             pos_a;
-	size_t             pos_b;
+	size_t pos_a;
+	size_t pos_b;
 
 	pos_a = make_header(buf_a, 1, 0, 0, 1);
 	write_u16(buf_a, 0x1000);
@@ -542,16 +566,16 @@ test_opt_non_cookie_data_affects_cache_key(void)
 	write_u16(buf_a + pos_a, DNS_TYPE_A);
 	write_u16(buf_a + pos_a + 2, DNS_CLASS_IN);
 	pos_a += 4;
-	pos_a = append_opt_record(buf_a, pos_a, 1232, 0, opt_a, sizeof(opt_a));
+	pos_a  = append_opt_record(buf_a, pos_a, 1232, 0, opt_a, sizeof(opt_a));
 
-	pos_b = make_header(buf_b, 1, 0, 0, 1);
+	pos_b  = make_header(buf_b, 1, 0, 0, 1);
 	write_u16(buf_b, 0x1001);
 	write_u16(buf_b + 2, DNS_FLAG_RD);
 	pos_b = append_name(buf_b, pos_b, "example.com");
 	write_u16(buf_b + pos_b, DNS_TYPE_A);
 	write_u16(buf_b + pos_b + 2, DNS_CLASS_IN);
 	pos_b += 4;
-	pos_b = append_opt_record(buf_b, pos_b, 1232, 0, opt_b, sizeof(opt_b));
+	pos_b  = append_opt_record(buf_b, pos_b, 1232, 0, opt_b, sizeof(opt_b));
 
 	assert(dns_parse_message(&msg_a, buf_a, pos_a) == 0);
 	assert(dns_parse_message(&msg_b, buf_b, pos_b) == 0);
@@ -590,19 +614,19 @@ test_response_match_uses_question_section_only(void)
 	pos = append_name(response_buf, pos, "example.com");
 	write_u16(response_buf + pos, DNS_TYPE_A);
 	write_u16(response_buf + pos + 2, DNS_CLASS_IN);
-	pos                  += 4;
+	pos                 += 4;
 
-	response_buf[pos++]   = 0xC0;
-	response_buf[pos++]   = DNS_HEADER_SIZE;
+	response_buf[pos++]  = 0xC0;
+	response_buf[pos++]  = DNS_HEADER_SIZE;
 	write_u16(response_buf + pos, DNS_TYPE_A);
 	write_u16(response_buf + pos + 2, DNS_CLASS_IN);
 	write_u32(response_buf + pos + 4, 300);
 	write_u16(response_buf + pos + 8, 4);
-	pos                  += 10;
-	response_buf[pos++]   = 192;
-	response_buf[pos++]   = 0;
-	response_buf[pos++]   = 2;
-	response_buf[pos++]   = 1;
+	pos                 += 10;
+	response_buf[pos++]  = 192;
+	response_buf[pos++]  = 0;
+	response_buf[pos++]  = 2;
+	response_buf[pos++]  = 1;
 
 	assert(dns_response_matches_query(&query, response_buf, pos));
 
@@ -691,6 +715,112 @@ test_response_matches_not_a_response(void)
 	assert(!dns_response_matches_query(&query, resp_buf, pos));
 }
 
+/* --- EDNS helpers --- */
+
+static void
+test_set_outbound_edns_synthesizes_opt_with_do(void)
+{
+	uint8_t            buf[DNS_MAX_MSG_SIZE];
+	struct dns_message msg;
+	size_t             pos = make_header(buf, 1, 0, 0, 0);
+
+	write_u16(buf, 0x1234);
+	write_u16(buf + 2, DNS_FLAG_RD);
+	pos = append_name(buf, pos, "example.com");
+	write_u16(buf + pos, DNS_TYPE_A);
+	write_u16(buf + pos + 2, DNS_CLASS_IN);
+	pos            += 4;
+
+	size_t new_len  = dns_set_outbound_edns(buf, pos, sizeof(buf));
+	assert(new_len == pos + 11);
+	assert(wire_read_u16(buf + 10) == 1);
+
+	assert(dns_parse_message(&msg, buf, new_len) == 0);
+	assert(msg.has_edns);
+	assert(msg.edns_version == 0);
+	assert(msg.cache_key.has_opt);
+	assert(msg.cache_key.opt_udp_size == 1232);
+	/* DO bit must be set in OPT flags (high bit of TTL low 16) */
+	assert((msg.cache_key.opt_ttl & 0x8000) != 0);
+}
+
+static void
+test_set_outbound_edns_flips_do_on_existing_opt(void)
+{
+	uint8_t            buf[DNS_MAX_MSG_SIZE];
+	struct dns_message msg;
+	size_t             pos        = make_header(buf, 1, 0, 0, 1);
+	uint8_t            nsid_opt[] = {
+		           0x00,
+		           DNS_EDNS_OPTION_NSID,
+		           0x00,
+		           0x03,
+		           'a',
+		           'b',
+		           'c',
+	};
+
+	write_u16(buf, 0x1234);
+	write_u16(buf + 2, DNS_FLAG_RD);
+	pos = append_name(buf, pos, "example.com");
+	write_u16(buf + pos, DNS_TYPE_A);
+	write_u16(buf + pos + 2, DNS_CLASS_IN);
+	pos                     += 4;
+	pos                      = append_opt_record(buf, pos, 4096, 0, nsid_opt, sizeof(nsid_opt));
+
+	uint16_t arcount_before  = wire_read_u16(buf + 10);
+	size_t   new_len         = dns_set_outbound_edns(buf, pos, sizeof(buf));
+
+	assert(new_len == pos);
+	assert(wire_read_u16(buf + 10) == arcount_before);
+
+	assert(dns_parse_message(&msg, buf, new_len) == 0);
+	assert(msg.has_edns);
+	assert(msg.cache_key.opt_udp_size == 4096);          /* preserved */
+	assert(msg.cache_key.opt_rdlen == sizeof(nsid_opt)); /* preserved */
+	assert((msg.cache_key.opt_ttl & 0x8000) != 0);       /* DO flipped on */
+}
+
+static void
+test_strip_response_opt_removes_opt_and_decrements_arcount(void)
+{
+	uint8_t buf[DNS_MAX_MSG_SIZE];
+	size_t  pos = make_header(buf, 1, 0, 0, 1);
+
+	write_u16(buf, 0x1234);
+	write_u16(buf + 2, DNS_FLAG_QR | DNS_FLAG_RD | DNS_FLAG_RA);
+	pos = append_name(buf, pos, "example.com");
+	write_u16(buf + pos, DNS_TYPE_A);
+	write_u16(buf + pos + 2, DNS_CLASS_IN);
+	pos            += 4;
+	pos             = append_opt_record(buf, pos, 1232, 0x00008000UL, NULL, 0);
+
+	size_t new_len  = dns_strip_response_opt(buf, pos);
+	assert(new_len == pos - 11);
+	assert(wire_read_u16(buf + 10) == 0);
+
+	struct dns_message msg;
+	assert(dns_parse_message(&msg, buf, new_len) == 0);
+	assert(!msg.has_edns);
+}
+
+static void
+test_strip_response_opt_noop_when_absent(void)
+{
+	uint8_t buf[DNS_MAX_MSG_SIZE];
+	size_t  pos = make_header(buf, 1, 0, 0, 0);
+
+	write_u16(buf, 0x1234);
+	write_u16(buf + 2, DNS_FLAG_QR | DNS_FLAG_RD | DNS_FLAG_RA);
+	pos = append_name(buf, pos, "example.com");
+	write_u16(buf + pos, DNS_TYPE_A);
+	write_u16(buf + pos + 2, DNS_CLASS_IN);
+	pos            += 4;
+
+	size_t new_len  = dns_strip_response_opt(buf, pos);
+	assert(new_len == pos);
+}
+
 /* --- string fallbacks --- */
 
 static void
@@ -737,6 +867,11 @@ main(void)
 
 	test_opt_cookie_ignored_in_cache_key();
 	test_opt_non_cookie_data_affects_cache_key();
+
+	test_set_outbound_edns_synthesizes_opt_with_do();
+	test_set_outbound_edns_flips_do_on_existing_opt();
+	test_strip_response_opt_removes_opt_and_decrements_arcount();
+	test_strip_response_opt_noop_when_absent();
 
 	test_response_match_uses_question_section_only();
 	test_response_matches_case_insensitive_qname();

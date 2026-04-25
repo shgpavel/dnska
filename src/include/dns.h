@@ -129,6 +129,35 @@ bool
 dns_response_matches_query(const struct dns_message *query,
                            const uint8_t *response, size_t response_len);
 
+/*
+ * Locate the OPT pseudo-RR in the additional section.
+ * Returns 0 on found (writes *opt_offset and *opt_total_len which is
+ * the wire length of the OPT RR including its name, fixed fields, and
+ * RDATA), 1 if no OPT is present, or -1 if the message is malformed.
+ */
+int
+dns_find_opt(const uint8_t *buf, size_t len,
+             size_t *opt_offset, size_t *opt_total_len);
+
+/*
+ * Ensure the message has an EDNS OPT record with DO=1.
+ * If an OPT already exists, sets the DO bit on its flags field.
+ * Otherwise appends a 1232-byte payload OPT pseudo-RR with DO=1 and
+ * bumps ARCOUNT.  Returns the new wire length, or 0 on failure (e.g.
+ * malformed message or insufficient capacity).
+ */
+size_t
+dns_set_outbound_edns(uint8_t *buf, size_t len, size_t max_size);
+
+/*
+ * Remove the OPT pseudo-RR from a response (e.g. before delivering to
+ * a non-EDNS client per RFC 6891 §6.1.1).  Decrements ARCOUNT.  Returns
+ * the new wire length, or the original length if no OPT or on parse
+ * failure.
+ */
+size_t
+dns_strip_response_opt(uint8_t *buf, size_t len);
+
 const char *
 dns_type_str(uint16_t type, char *buf, size_t buf_len);
 const char *

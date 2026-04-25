@@ -4,16 +4,30 @@
 #define DNSKA_CONFIG_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+#include <netinet/in.h>
+
+enum {
+	DNS_UPSTREAM_MAX_ADDRS = 4,
+};
 
 struct dns_config {
 	int      listen_port;
-	char     upstream_addr[256];     /* resolved IP of upstream */
+	char     upstream_addr[256]; /* primary upstream IP for logs */
+	char     upstream_addrs[DNS_UPSTREAM_MAX_ADDRS][INET6_ADDRSTRLEN];
+	size_t   upstream_addr_count;
 	char     upstream_hostname[256]; /* original hostname, empty if IP */
 	uint16_t upstream_port;
 	bool     upstream_tls;           /* forward to upstream over DoT */
+	bool     upstream_doh;           /* forward to upstream over DoH (RFC 8484) */
+	char     doh_path[128];          /* DoH URL path (default /dns-query) */
 	char     tls_cert[256];          /* PEM cert for DoT listener */
 	char     tls_key[256];           /* PEM key for DoT listener */
+	char     tls_ca_file[256];       /* PEM CA bundle for upstream verify */
+	char     tls_auth_name[256];     /* override SNI/verify name for IP upstream */
+	bool     tls_insecure;           /* skip upstream cert verification */
 };
 
 int

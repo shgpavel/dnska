@@ -1,0 +1,43 @@
+; dnska.conf example.  Drop in next to the binary or pass with -c.
+; CLI flags override these values.
+
+[dns]
+
+; Listen port.  Defaults to 53 in plain mode, 853 in DoT mode.
+;port = 53
+
+; Upstream resolver.  Either an IP literal or a hostname.  A hostname
+; implies DoT (port 853 default) unless --upstream-doh is also set, in
+; which case DoH is used (port 443 default).
+;upstream = 1.1.1.1
+;upstream = dns.google
+
+; Override upstream port (overrides the auto-default above).
+;upstream_port = 853
+
+; Force DoT for an IP-literal upstream.
+;upstream_tls = true
+
+; DoH upstream (RFC 8484).  Implies TLS.  Requires a hostname or
+; tls_auth_name (Host header + verification name).
+;upstream_doh = true
+
+; Override DoH URL path.
+;doh_path = /dns-query
+
+; --- Listener TLS (DoT server) ---
+; Both must be set together; otherwise an ephemeral self-signed cert
+; is generated.  The key file must be mode 0600.
+;tls_cert = /etc/dnska/cert.pem
+;tls_key  = /etc/dnska/key.pem
+
+; --- Upstream TLS verification ---
+; Custom CA bundle.  Empty -> use system trust paths.
+;tls_ca_file = /etc/ssl/certs/ca-certificates.crt
+
+; Override SNI / verify hostname (required for DoT/DoH against an IP
+; literal upstream when verification is on).
+;tls_auth_name = dns.google
+
+; Disable upstream cert verification.  Testing only.
+;tls_insecure = false

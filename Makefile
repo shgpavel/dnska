@@ -9,7 +9,12 @@ TARGET  = build/dnska
 TESTDIR = test
 TESTOBJDIR = $(OBJDIR)/test
 
-SRCS    = $(SRCDIR)/main.c $(SRCDIR)/cache.c $(SRCDIR)/config.c $(SRCDIR)/dns.c $(SRCDIR)/log.c $(SRCDIR)/random.c $(SRCDIR)/server.c $(SRCDIR)/resolver.c $(SRCDIR)/wire.c
+PREFIX     ?= /usr
+BINDIR     ?= $(PREFIX)/bin
+SYSCONFDIR ?= /etc
+DOCDIR     ?= $(PREFIX)/share/doc/dnska
+
+SRCS    = $(SRCDIR)/main.c $(SRCDIR)/cache.c $(SRCDIR)/config.c $(SRCDIR)/dns.c $(SRCDIR)/log.c $(SRCDIR)/print.c $(SRCDIR)/random.c $(SRCDIR)/server.c $(SRCDIR)/resolver.c $(SRCDIR)/wire.c
 OBJS    = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
 HDRS    = $(wildcard $(SRCDIR)/include/*.h)
 TEST_SRCS = $(wildcard $(TESTDIR)/*/*_test.c)
@@ -23,10 +28,10 @@ PERF_TARGETS = $(addprefix $(TESTOBJDIR)/,$(PERF_NAMES))
 all: $(TARGET)
 
 check: $(TEST_TARGETS)
-	for t in $(TEST_TARGETS); do ./$$t; done
+	set -e; for t in $(TEST_TARGETS); do ./$$t; done
 
 perf: $(PERF_TARGETS)
-	for t in $(PERF_TARGETS); do ./$$t; done
+	set -e; for t in $(PERF_TARGETS); do ./$$t; done
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(dir $@)
@@ -44,9 +49,13 @@ $(TESTOBJDIR)/dns_test: $(TESTDIR)/dns/dns_test.c $(SRCDIR)/dns.c $(SRCDIR)/wire
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/dns/dns_test.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c
 
-$(TESTOBJDIR)/resolver_test: $(TESTDIR)/resolver/resolver_test.c $(SRCDIR)/resolver.c $(SRCDIR)/random.c $(HDRS)
+$(TESTOBJDIR)/print_test: $(TESTDIR)/print/print_test.c $(SRCDIR)/print.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c $(HDRS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/resolver/resolver_test.c $(SRCDIR)/resolver.c $(SRCDIR)/random.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/print/print_test.c $(SRCDIR)/print.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c
+
+$(TESTOBJDIR)/resolver_test: $(TESTDIR)/resolver/resolver_test.c $(SRCDIR)/resolver.c $(SRCDIR)/dns.c $(SRCDIR)/random.c $(SRCDIR)/wire.c $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/resolver/resolver_test.c $(SRCDIR)/resolver.c $(SRCDIR)/dns.c $(SRCDIR)/random.c $(SRCDIR)/wire.c
 
 $(TESTOBJDIR)/server_test: $(TESTDIR)/server/server_test.c \
     $(SRCDIR)/server.c $(SRCDIR)/cache.c $(SRCDIR)/config.c \
@@ -68,7 +77,22 @@ $(TESTOBJDIR)/cache_perf: $(TESTDIR)/perf/cache_perf.c \
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/perf/cache_perf.c \
 	    $(SRCDIR)/cache.c $(SRCDIR)/random.c $(SRCDIR)/wire.c
 
+install: $(TARGET)
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)/dnska
+	install -d $(DESTDIR)$(SYSCONFDIR)/dnska
+	install -m 0644 dnska.conf.example $(DESTDIR)$(SYSCONFDIR)/dnska/dnska.conf.example
+	install -d $(DESTDIR)$(DOCDIR)
+	install -m 0644 README.md $(DESTDIR)$(DOCDIR)/README.md
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/dnska
+	rm -f $(DESTDIR)$(SYSCONFDIR)/dnska/dnska.conf.example
+	-rmdir $(DESTDIR)$(SYSCONFDIR)/dnska 2>/dev/null
+	rm -f $(DESTDIR)$(DOCDIR)/README.md
+	-rmdir $(DESTDIR)$(DOCDIR) 2>/dev/null
+
 clean:
 	rm -rf $(OBJDIR)
 
-.PHONY: all check perf clean
+.PHONY: all check perf install uninstall clean
