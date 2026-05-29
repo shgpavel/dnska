@@ -4,21 +4,24 @@ This file provides guidance to Claude Code when working in this repository.
 
 ## Project Overview
 
-**dnska** is a DNS forwarder with an in-memory response cache and DNS over TLS
-(DoT) support. It listens on IPv4 and IPv6 UDP and TCP sockets (plain mode) or
-DoT sockets (TLS mode), parses DNS queries, forwards cache misses to a single
-upstream DNS server, and returns raw DNS responses to the client.
+**dnska** is a DNS forwarder with an in-memory response cache, DNS over TLS
+(DoT), and DNS over HTTPS (DoH) upstream support. It listens on IPv4 and IPv6
+UDP and TCP sockets (plain listener mode) or DoT sockets, parses DNS queries,
+forwards cache misses to a single upstream DNS server, and returns raw DNS
+responses to the client.
 
 Current scope:
 
 - Implemented: UDP listener, TCP listener, DoT listener (RFC 7858), DoT
-  upstream forwarding, config file parsing, upstream forwarding, query
+  upstream forwarding, DoH upstream forwarding (RFC 8484), config file parsing,
+  upstream forwarding, query
   parsing/validation, fixed-size LRU cache, cached negative responses, cached
   upstream SERVFAIL responses, IPv4 and IPv6 upstream support, hostname
   resolution for upstreams with automatic DoT mode, ephemeral self-signed cert
-  generation for the DoT listener, SNI on outbound DoT connections
-- Not implemented yet: DoH, DNSSEC validation, persistent cache, upstream
-  certificate verification (DoT uses opportunistic mode only)
+  generation for the DoT listener, SNI on outbound TLS connections, upstream
+  certificate verification controls
+- Not implemented yet: DNSSEC validation, persistent cache, DoH server
+  listener, upstream connection pooling
 
 The `refs/` directory contains reference implementations used for study:
 
@@ -46,33 +49,46 @@ Compiler/toolchain details:
 
 Startup flow:
 
-1. `main.c` seeds defaults: listen port `53`, upstream `8.8.8.8:53`
+1. `main.c` seeds defaults: listen port `53`, listener mode `auto`,
+   upstream `8.8.8.8:53`
 2. Optional config file is loaded from `dnska.conf` or `--config/-c`
 3. CLI flags override config values
 4. If upstream is a hostname (not a literal IP), it is resolved via
-   `getaddrinfo`; the hostname implies DoT (`upstream_tls = true`) and the
-   upstream port defaults to `853` unless set explicitly
-5. If DoT mode is active and no explicit listen port was given, the listen
-   port defaults to `853`
-6. `server_init()` creates the thread pool and cache, then — based on
-   `upstream_tls` — binds either DoT sockets (TLS TCP) or plain sockets
-   (UDP + TCP) on the listen port; for DoT, a self-signed P-256 cert is
-   generated in memory unless `--tls-cert`/`--tls-key` paths are provided
-7. `server_run()` enters a `poll()` loop over up to 4 fds
+   `getaddrinfo`; the hostname implies DoT upstream (`upstream_tls = true`)
+   and the upstream port defaults to `853` unless set explicitly
+5. DoH upstream implies TLS upstream and defaults the upstream port to `443`
+   unless set explicitly
+6. The effective listener mode is resolved from `listen_mode`: `auto` keeps
+   legacy behavior (DoT upstream -> DoT listener, otherwise plain), while
+   `plain` and `dot` override only the inbound listener
+7. If no explicit listen port was given, the listen port defaults to `853`
+   for an effective DoT listener and `53` for a plain listener
+8. `server_init()` creates the thread pool and cache, then binds either DoT
+   sockets (TLS TCP) or plain sockets (UDP + TCP) on the listen port; for DoT,
+   a self-signed P-256 cert is generated in memory unless `--tls-cert`/
+   `--tls-key` paths are provided
+9. `server_run()` enters a `poll()` loop over up to 4 fds
    (IPv4/IPv6 × UDP + TCP in plain mode, or IPv4/IPv6 × DoT in TLS mode)
 
 Config file support:
 
 - Section: `[dns]`
-- Keys: `upstream`, `port`/`listen_port`, `upstream_port`, `upstream_tls`,
-  `tls_cert`, `tls_key`
+- Keys: `upstream`, `port`/`listen_port`, `listen_mode`, `upstream_port`,
+  `upstream_tls`, `upstream_doh`, `doh_path`, `tls_cert`, `tls_key`,
+  `tls_ca_file`, `tls_auth_name`, `tls_insecure`
+- `#` and `;` comments are accepted
 
 CLI flags:
 
 - `-p/--port`, `-u/--upstream`, `--upstream-port` (long only)
+- `--listen-mode auto|plain|dot` — choose inbound listener mode independently
+  of upstream transport
 - `-t/--upstream-tls` — force DoT upstream when using a literal IP
+- `--upstream-doh`, `--doh-path` — force DoH upstream and optional URL path
 - `-k/--tls-key`, `--tls-cert` (long only) — custom PEM cert/key for the
   DoT listener (optional; an ephemeral self-signed cert is used if omitted)
+- `--tls-ca`, `--tls-auth-name`, `--insecure` — upstream TLS verification
+  controls
 - `-v/--verbose`, `-h/--help`
 
 Typical invocations:
@@ -83,6 +99,12 @@ sudo ./build/dnska -u 8.8.8.8
 
 # DoT listener (port 853 default), DoT upstream — hostname triggers both
 sudo ./build/dnska -u dns.shago.dev
+
+# Plain DNS listener, DoT upstream
+sudo ./build/dnska -u dns.google --listen-mode plain
+
+# DoT listener, DoH upstream
+sudo ./build/dnska -u dns.google --upstream-doh --listen-mode dot
 
 # DoT listener on a custom port, DoT upstream via IP
 sudo ./build/dnska -u 8.8.8.8 -t -p 8853
@@ -162,10 +184,12 @@ Insertion safety:
 
 Server behavior:
 
-- In plain mode (`upstream_tls = false`): binds IPv4 and IPv6 UDP sockets and
-  IPv4 and IPv6 TCP sockets on the listen port
-- In DoT mode (`upstream_tls = true`): binds IPv4 and IPv6 TLS TCP sockets on
-  the listen port; no UDP or plain TCP sockets are created
+- In plain listener mode: binds IPv4 and IPv6 UDP sockets and IPv4 and IPv6
+  TCP sockets on the listen port
+- In DoT listener mode: binds IPv4 and IPv6 TLS TCP sockets on the listen
+  port; no UDP or plain TCP sockets are created
+- Listener mode is independent from upstream transport after defaults are
+  resolved
 - Uses `SO_REUSEADDR`; sets `IPV6_V6ONLY` on IPv6 sockets
 - Uses `poll()` to multiplex up to 4 listen fds
 - Maintains a fixed worker thread pool of `MAX_CONCURRENT_QUERIES` (64) threads
@@ -176,10 +200,12 @@ Resolver behavior:
 
 - Plain UDP: opens a new socket per query, random source port, 0x20 QNAME
   randomization (RFC 5452), retries TCP on TC=1 (RFC 7766 §6.2.1)
-- DoT (`upstream_tls = true`): skips UDP entirely, connects over TLS 1.2+,
-  uses the same 2-byte length-prefix framing as DNS-over-TCP; SNI is set when
-  the upstream was given as a hostname; no certificate verification
-  (opportunistic privacy per RFC 7858 §4.1)
+- DoT (`upstream_tls = true`, `upstream_doh = false`): skips UDP entirely,
+  connects over TLS 1.2+, uses the same 2-byte length-prefix framing as
+  DNS-over-TCP; SNI is set when the upstream was given as a hostname or
+  `tls_auth_name` is configured
+- DoH (`upstream_doh = true`): sends HTTP/1.1 POST requests with
+  `application/dns-message` bodies over TLS
 - On upstream failure the server synthesizes a SERVFAIL response
 
 DoT listener behavior:
@@ -237,8 +263,8 @@ Keep these in mind when making changes:
 - DoT upstream uses a module-level `SSL_CTX` (client) initialized via
   `pthread_once`; DoT server uses a per-`struct server` `SSL_CTX` initialized
   in `server_init()`
-- Adding upstream certificate verification requires relaxing the opportunistic
-  mode — SNI is already set when the upstream was specified as a hostname, so
-  the main remaining work is enabling `SSL_VERIFY_PEER` and loading a CA bundle
-- The listener mode (plain vs DoT) is determined solely by `upstream_tls`; there
-  is no separate `dot_port` config — the same `listen_port` is used for both
+- Listener mode is explicit (`auto`, `plain`, `dot`) and stored in
+  `struct dns_config`; `auto` is resolved by `config_effective_listen_mode()`
+  using the legacy upstream-derived behavior
+- There is no separate `dot_port` config — the same `listen_port` is used for
+  both plain and DoT listeners

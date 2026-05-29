@@ -38,6 +38,10 @@
 
 # Build output
 build/
+compile_commands.json
+
+# Local agent state
+.codex
 
 # Debug files
 *.dSYM/

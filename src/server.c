@@ -1093,16 +1093,19 @@ make_selfsigned_cert(SSL_CTX *ctx)
 int
 server_init(struct server *srv, const struct dns_config *cfg)
 {
+	enum dns_listen_mode listen_mode = config_effective_listen_mode(cfg);
+
 	memset(srv, 0, sizeof(*srv));
-	srv->sock_fd      = -1;
-	srv->sock_fd6     = -1;
-	srv->tcp_fd       = -1;
-	srv->tcp_fd6      = -1;
-	srv->dot_fd       = -1;
-	srv->dot_fd6      = -1;
-	srv->tls_ctx      = NULL;
-	srv->pending_head = 0;
-	srv->config       = *cfg;
+	srv->sock_fd            = -1;
+	srv->sock_fd6           = -1;
+	srv->tcp_fd             = -1;
+	srv->tcp_fd6            = -1;
+	srv->dot_fd             = -1;
+	srv->dot_fd6            = -1;
+	srv->tls_ctx            = NULL;
+	srv->pending_head       = 0;
+	srv->config             = *cfg;
+	srv->config.listen_mode = listen_mode;
 
 	if (random_bytes(&srv->source_hash_seed,
 	                 sizeof(srv->source_hash_seed))
@@ -1139,7 +1142,7 @@ server_init(struct server *srv, const struct dns_config *cfg)
 		srv->query_tasks[i].tls         = NULL;
 	}
 
-	if (cfg->upstream_tls && !cfg->upstream_doh) {
+	if (listen_mode == DNS_LISTEN_DOT) {
 		/* DoT listener (RFC 7858) */
 		SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
 		if (ctx == NULL) {
@@ -1271,12 +1274,11 @@ server_init(struct server *srv, const struct dns_config *cfg)
 		}
 	}
 
-	const char *listener_kind = (srv->config.upstream_tls
-	                             && !srv->config.upstream_doh) ?
-	                                    "DoT" :
-	                                    "UDP+TCP";
-	const char *upstream_kind = srv->config.upstream_doh ? " (DoH)" : srv->config.upstream_tls ? " (DoT)" :
-	                                                                                             "";
+	const char *listener_kind = listen_mode == DNS_LISTEN_DOT ? "DoT" :
+	                                                            "UDP+TCP";
+	const char *upstream_kind = srv->config.upstream_doh ? " (DoH)" :
+	                            srv->config.upstream_tls ? " (DoT)" :
+	                                                       "";
 
 	srv->running              = 1;
 	log_msg(LOG_INFO,

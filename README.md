@@ -37,6 +37,10 @@ make clean
 sudo ./build/dnska -u 8.8.8.8                  # plain UDP+TCP, port 53
 sudo ./build/dnska -u 8.8.8.8 -t               # DoT upstream + DoT listener (853)
 sudo ./build/dnska -u dns.shago.dev            # hostname auto-DoT (853)
+sudo ./build/dnska -u dns.google --listen-mode plain
+                                                # plain listener, DoT upstream
+sudo ./build/dnska -u dns.google --upstream-doh --listen-mode dot
+                                                # DoT listener, DoH upstream
 sudo ./build/dnska -u 1.1.1.1 --upstream-doh \
                    --tls-auth-name cloudflare-dns.com  # DoH over IP literal
 ```
@@ -57,15 +61,16 @@ Exit codes: `0` on `NOERROR`, `2` on any other DNS rcode (e.g.
 Loads `dnska.conf` from the working directory by default, or the path
 given to `-c`/`--config`.  CLI flags override config values.
 
-Section: `[dns]`.  See `dnska.conf.example` for the full annotated key
-list.
+Section: `[dns]`.  `#` and `;` comments are accepted.  See
+`dnska.conf.example` for the full annotated key list.
 
 ## CLI flags
 
 | Flag | Description |
 |------|-------------|
 | `-c FILE` | Config file (default `dnska.conf`) |
-| `-p PORT` | Listen port (default 53; 853 for DoT mode) |
+| `-p PORT` | Listen port (default 53; 853 for DoT listener) |
+| `--listen-mode M` | Listener mode: `auto`, `plain`, or `dot` |
 | `-u ADDR` | Upstream IP or hostname (default `8.8.8.8`); hostname implies DoT, port 853 |
 | `--upstream-port N` | Override upstream port |
 | `-t` | Force DoT upstream when using an IP-literal upstream |
@@ -81,6 +86,10 @@ list.
 | `--class C` | RR class for `-q` (default IN, only IN supported) |
 | `-v` | Debug logging |
 | `-h` | Help |
+
+`--listen-mode auto` preserves legacy behavior: a DoT upstream selected by
+hostname or `-t` also creates a DoT listener; DoH and plain upstreams create a
+plain UDP+TCP listener.  `plain` and `dot` override only the listener side.
 
 ## Limitations
 

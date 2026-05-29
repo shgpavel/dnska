@@ -167,18 +167,27 @@ get_bound_port(int fd)
 	return -1;
 }
 
+static void
+init_server_config(struct dns_config *cfg, const char *upstream_addr,
+                   int upstream_port)
+{
+	memset(cfg, 0, sizeof(*cfg));
+	cfg->listen_port   = 0; /* kernel assigns port */
+	cfg->listen_mode   = DNS_LISTEN_AUTO;
+	cfg->upstream_port = (uint16_t)upstream_port;
+	snprintf(cfg->upstream_addr, sizeof(cfg->upstream_addr),
+	         "%s", upstream_addr);
+	snprintf(cfg->upstream_addrs[0], INET6_ADDRSTRLEN, "%s",
+	         upstream_addr);
+	cfg->upstream_addr_count = 1;
+}
+
 static int
 start_test_server(struct test_server *ts, const char *upstream_addr,
                   int upstream_port)
 {
 	struct dns_config cfg;
-	memset(&cfg, 0, sizeof(cfg));
-	cfg.listen_port   = 0; /* kernel assigns port */
-	cfg.upstream_port = (uint16_t)upstream_port;
-	snprintf(cfg.upstream_addr, sizeof(cfg.upstream_addr),
-	         "%s", upstream_addr);
-	snprintf(cfg.upstream_addrs[0], INET6_ADDRSTRLEN, "%s", upstream_addr);
-	cfg.upstream_addr_count = 1;
+	init_server_config(&cfg, upstream_addr, upstream_port);
 
 	memset(ts, 0, sizeof(*ts));
 	ts->udp_port = -1;
@@ -937,14 +946,8 @@ start_dot_test_server(struct test_server *ts, const char *upstream_addr,
                       int upstream_port)
 {
 	struct dns_config cfg;
-	memset(&cfg, 0, sizeof(cfg));
-	cfg.listen_port   = 0; /* kernel assigns port */
-	cfg.upstream_port = (uint16_t)upstream_port;
-	cfg.upstream_tls  = true;
-	snprintf(cfg.upstream_addr, sizeof(cfg.upstream_addr),
-	         "%s", upstream_addr);
-	snprintf(cfg.upstream_addrs[0], INET6_ADDRSTRLEN, "%s", upstream_addr);
-	cfg.upstream_addr_count = 1;
+	init_server_config(&cfg, upstream_addr, upstream_port);
+	cfg.upstream_tls = true;
 
 	memset(ts, 0, sizeof(*ts));
 	ts->udp_port = -1;
@@ -962,6 +965,88 @@ start_dot_test_server(struct test_server *ts, const char *upstream_addr,
 		return -1;
 
 	return 0;
+}
+
+static void
+test_explicit_plain_listener_with_dot_upstream(void)
+{
+	struct dns_config cfg;
+	struct server     srv;
+
+	init_server_config(&cfg, "127.0.0.1", 853);
+	cfg.listen_mode  = DNS_LISTEN_PLAIN;
+	cfg.upstream_tls = true;
+
+	TEST_CHECK(server_init(&srv, &cfg) == 0);
+	TEST_CHECK(srv.sock_fd >= 0);
+	TEST_CHECK(srv.tcp_fd >= 0);
+	TEST_CHECK(srv.dot_fd < 0);
+	TEST_CHECK(srv.tls_ctx == NULL);
+	TEST_EXPECT_INT_EQ(srv.config.listen_mode, DNS_LISTEN_PLAIN);
+	TEST_CHECK(srv.config.upstream_tls);
+	TEST_CHECK(!srv.config.upstream_doh);
+
+	server_stop(&srv);
+}
+
+static void
+test_explicit_dot_listener_with_doh_upstream(void)
+{
+	struct dns_config cfg;
+	struct server     srv;
+
+	init_server_config(&cfg, "127.0.0.1", 443);
+	cfg.listen_mode  = DNS_LISTEN_DOT;
+	cfg.upstream_tls = true;
+	cfg.upstream_doh = true;
+
+	TEST_CHECK(server_init(&srv, &cfg) == 0);
+	TEST_CHECK(srv.sock_fd < 0);
+	TEST_CHECK(srv.tcp_fd < 0);
+	TEST_CHECK(srv.dot_fd >= 0);
+	TEST_CHECK(srv.tls_ctx != NULL);
+	TEST_EXPECT_INT_EQ(srv.config.listen_mode, DNS_LISTEN_DOT);
+	TEST_CHECK(srv.config.upstream_tls);
+	TEST_CHECK(srv.config.upstream_doh);
+
+	server_stop(&srv);
+}
+
+static void
+test_auto_listener_legacy_dot_upstream(void)
+{
+	struct dns_config cfg;
+	struct server     srv;
+
+	init_server_config(&cfg, "127.0.0.1", 853);
+	cfg.upstream_tls = true;
+
+	TEST_CHECK(server_init(&srv, &cfg) == 0);
+	TEST_CHECK(srv.sock_fd < 0);
+	TEST_CHECK(srv.tcp_fd < 0);
+	TEST_CHECK(srv.dot_fd >= 0);
+	TEST_EXPECT_INT_EQ(srv.config.listen_mode, DNS_LISTEN_DOT);
+
+	server_stop(&srv);
+}
+
+static void
+test_auto_listener_doh_upstream_plain_listener(void)
+{
+	struct dns_config cfg;
+	struct server     srv;
+
+	init_server_config(&cfg, "127.0.0.1", 443);
+	cfg.upstream_tls = true;
+	cfg.upstream_doh = true;
+
+	TEST_CHECK(server_init(&srv, &cfg) == 0);
+	TEST_CHECK(srv.sock_fd >= 0);
+	TEST_CHECK(srv.tcp_fd >= 0);
+	TEST_CHECK(srv.dot_fd < 0);
+	TEST_EXPECT_INT_EQ(srv.config.listen_mode, DNS_LISTEN_PLAIN);
+
+	server_stop(&srv);
 }
 
 /*
@@ -1109,6 +1194,10 @@ main(void)
 	test_tcp_badvers();
 	test_tcp_pipelining();
 	test_tcp_no_truncation();
+	test_explicit_plain_listener_with_dot_upstream();
+	test_explicit_dot_listener_with_doh_upstream();
+	test_auto_listener_legacy_dot_upstream();
+	test_auto_listener_doh_upstream_plain_listener();
 	test_dot_listener_autocert();
 
 	puts("server tests passed");

@@ -25,6 +25,7 @@ static volatile sig_atomic_t *g_running;
 static struct option          long_options[] = {
 	{ "config",        required_argument, NULL, 'c' },
 	{ "port",          required_argument, NULL, 'p' },
+	{ "listen-mode",   required_argument, NULL, 'M' }, /* long only */
 	{ "upstream",      required_argument, NULL, 'u' },
 	{ "upstream-port", required_argument, NULL, 'P' }, /* long only */
 	{ "upstream-tls",  no_argument,       NULL, 't' },
@@ -50,7 +51,9 @@ usage(const char *prog)
 	fprintf(stderr, "  -c, --config FILE      "
 	                "Config file (default: dnska.conf)\n");
 	fprintf(stderr, "  -p, --port PORT        "
-	                "Listen port (default: 53)\n");
+	                "Listen port (default: 53; 853 for DoT listener)\n");
+	fprintf(stderr, "      --listen-mode M    "
+	                "Listener mode: auto, plain, or dot\n");
 	fprintf(stderr, "  -u, --upstream ADDR    "
 	                "Upstream DNS server IP or hostname (default: 8.8.8.8);\n"
 	                "                         "
@@ -232,6 +235,7 @@ main(int argc, char **argv)
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.listen_port = 53;
+	cfg.listen_mode = DNS_LISTEN_AUTO;
 	snprintf(cfg.upstream_addr, sizeof(cfg.upstream_addr), "8.8.8.8");
 	cfg.upstream_port = 53;
 
@@ -247,9 +251,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	bool upstream_port_explicit = false;
-	bool listen_port_explicit   = false;
-	int  opt;
+	int opt;
 	optind = 0;
 	while ((opt = getopt_long(argc, argv, "c:p:u:tk:q:vh",
 	                          long_options, NULL))
@@ -264,10 +266,20 @@ main(int argc, char **argv)
 				        optarg);
 				return 1;
 			}
-			cfg.listen_port      = (int)port;
-			listen_port_explicit = true;
+			cfg.listen_port          = (int)port;
+			cfg.listen_port_explicit = true;
 			break;
 		}
+		case 'M':
+			if (config_parse_listen_mode(optarg,
+			                             &cfg.listen_mode)
+			    < 0) {
+				fprintf(stderr,
+				        "error: invalid listen mode: %s\n",
+				        optarg);
+				return 1;
+			}
+			break;
 		case 'u':
 			snprintf(cfg.upstream_addr, sizeof(cfg.upstream_addr),
 			         "%s", optarg);
@@ -280,8 +292,8 @@ main(int argc, char **argv)
 				        optarg);
 				return 1;
 			}
-			cfg.upstream_port      = port;
-			upstream_port_explicit = true;
+			cfg.upstream_port          = port;
+			cfg.upstream_port_explicit = true;
 			break;
 		}
 		case 't':
@@ -347,18 +359,19 @@ main(int argc, char **argv)
 
 	struct in_addr  tmp4;
 	struct in6_addr tmp6;
+	bool            upstream_is_hostname = false;
+
 	if (inet_pton(AF_INET, cfg.upstream_addr, &tmp4) != 1
-	    && inet_pton(AF_INET6, cfg.upstream_addr, &tmp6) != 1) {
+	    && inet_pton(AF_INET6, cfg.upstream_addr, &tmp6) != 1)
+		upstream_is_hostname = true;
+
+	if (upstream_is_hostname) {
 		/*
 		 * Not a literal IP address: treat as a hostname and resolve
-		 * it.  A hostname upstream implies DoT; default to port 853
-		 * unless the user set a port explicitly.
+		 * it.  Transport defaults are applied after resolution.
 		 */
 		snprintf(cfg.upstream_hostname, sizeof(cfg.upstream_hostname),
 		         "%s", cfg.upstream_addr);
-		cfg.upstream_tls = true;
-		if (!upstream_port_explicit)
-			cfg.upstream_port = cfg.upstream_doh ? 443 : 853;
 
 		struct addrinfo  hints;
 		struct addrinfo *res = NULL;
@@ -410,25 +423,13 @@ main(int argc, char **argv)
 		cfg.upstream_addr_count = 1;
 	}
 
-	/*
-	 * When DoT mode is active (hostname upstream or -t flag) default the
-	 * listen port to 853 unless the user set one explicitly.  DoH only
-	 * affects outbound transport; the listener stays plain on port 53.
-	 */
-	if (cfg.upstream_tls && !cfg.upstream_doh && !listen_port_explicit)
-		cfg.listen_port = 853;
+	config_apply_transport_defaults(&cfg, upstream_is_hostname);
 
 	/*
 	 * DoH implies TLS upstream and requires a hostname (Host header).
 	 * For an IP-literal upstream the operator must supply --tls-auth-name.
 	 */
 	if (cfg.upstream_doh) {
-		cfg.upstream_tls = true;
-		if (!upstream_port_explicit && cfg.upstream_port == 53)
-			cfg.upstream_port = 443;
-		if (cfg.doh_path[0] == '\0')
-			snprintf(cfg.doh_path, sizeof(cfg.doh_path),
-			         "/dns-query");
 		if (cfg.upstream_hostname[0] == '\0'
 		    && cfg.tls_auth_name[0] == '\0') {
 			fprintf(stderr,

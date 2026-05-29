@@ -6,6 +6,12 @@
 ; Listen port.  Defaults to 53 in plain mode, 853 in DoT mode.
 ;port = 53
 
+; Listener mode:
+;   auto  - legacy behavior: DoT upstream implies DoT listener
+;   plain - UDP+TCP listener regardless of upstream transport
+;   dot   - DoT listener regardless of upstream transport
+;listen_mode = auto
+
 ; Upstream resolver.  Either an IP literal or a hostname.  A hostname
 ; implies DoT (port 853 default) unless --upstream-doh is also set, in
 ; which case DoH is used (port 443 default).

@@ -45,6 +45,10 @@ $(TESTOBJDIR)/cache_test: $(TESTDIR)/cache/cache_test.c $(SRCDIR)/cache.c $(SRCD
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/cache/cache_test.c $(SRCDIR)/cache.c $(SRCDIR)/random.c $(SRCDIR)/wire.c
 
+$(TESTOBJDIR)/config_test: $(TESTDIR)/config/config_test.c $(SRCDIR)/config.c $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/config/config_test.c $(SRCDIR)/config.c
+
 $(TESTOBJDIR)/dns_test: $(TESTDIR)/dns/dns_test.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c $(HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/dns/dns_test.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c

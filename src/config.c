@@ -20,6 +20,21 @@ trim(char *s)
 	return s;
 }
 
+static void
+strip_comment(char *s)
+{
+	bool in_quote = false;
+
+	for (; *s != '\0'; s++) {
+		if (*s == '"')
+			in_quote = !in_quote;
+		if (!in_quote && (*s == '#' || *s == ';')) {
+			*s = '\0';
+			return;
+		}
+	}
+}
+
 int
 config_parse_port_u16(const char *value, uint16_t *out)
 {
@@ -34,6 +49,63 @@ config_parse_port_u16(const char *value, uint16_t *out)
 
 	*out = (uint16_t)port;
 	return 0;
+}
+
+int
+config_parse_listen_mode(const char *value, enum dns_listen_mode *out)
+{
+	if (strcmp(value, "auto") == 0) {
+		*out = DNS_LISTEN_AUTO;
+		return 0;
+	}
+	if (strcmp(value, "plain") == 0) {
+		*out = DNS_LISTEN_PLAIN;
+		return 0;
+	}
+	if (strcmp(value, "dot") == 0) {
+		*out = DNS_LISTEN_DOT;
+		return 0;
+	}
+
+	return -1;
+}
+
+enum dns_listen_mode
+config_effective_listen_mode(const struct dns_config *cfg)
+{
+	if (cfg->listen_mode != DNS_LISTEN_AUTO)
+		return cfg->listen_mode;
+
+	if (cfg->upstream_tls && !cfg->upstream_doh)
+		return DNS_LISTEN_DOT;
+
+	return DNS_LISTEN_PLAIN;
+}
+
+void
+config_apply_transport_defaults(struct dns_config *cfg, bool upstream_is_hostname)
+{
+	if (upstream_is_hostname)
+		cfg->upstream_tls = true;
+
+	if (cfg->upstream_doh) {
+		cfg->upstream_tls = true;
+		if (cfg->doh_path[0] == '\0')
+			snprintf(cfg->doh_path, sizeof(cfg->doh_path),
+			         "/dns-query");
+	}
+
+	if (!cfg->upstream_port_explicit) {
+		if (cfg->upstream_doh)
+			cfg->upstream_port = 443;
+		else if (cfg->upstream_tls)
+			cfg->upstream_port = 853;
+	}
+
+	if (!cfg->listen_port_explicit) {
+		enum dns_listen_mode mode = config_effective_listen_mode(cfg);
+		cfg->listen_port          = mode == DNS_LISTEN_DOT ? 853 : 53;
+	}
 }
 
 int
@@ -57,9 +129,10 @@ config_load(const char *path, struct dns_config *cfg)
 			return -1;
 		}
 
+		strip_comment(line);
 		char *p = trim(line);
 
-		if (*p == '\0' || *p == '#')
+		if (*p == '\0')
 			continue;
 
 		if (*p == '[') {
@@ -105,7 +178,8 @@ config_load(const char *path, struct dns_config *cfg)
 				fclose(f);
 				return -1;
 			}
-			cfg->listen_port = (int)port;
+			cfg->listen_port          = (int)port;
+			cfg->listen_port_explicit = true;
 		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "upstream_port") == 0) {
 			uint16_t port;
@@ -116,7 +190,18 @@ config_load(const char *path, struct dns_config *cfg)
 				fclose(f);
 				return -1;
 			}
-			cfg->upstream_port = port;
+			cfg->upstream_port          = port;
+			cfg->upstream_port_explicit = true;
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "listen_mode") == 0) {
+			if (config_parse_listen_mode(val,
+			                             &cfg->listen_mode)
+			    < 0) {
+				fprintf(stderr, "config: invalid listen mode: %s\n",
+				        val);
+				fclose(f);
+				return -1;
+			}
 		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "upstream_tls") == 0) {
 			cfg->upstream_tls = (strcmp(val, "1") == 0
