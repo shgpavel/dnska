@@ -13,6 +13,7 @@
 
 #include "config.h"
 #include "dns.h"
+#include "doh_server.h"
 #include "log.h"
 #include "print.h"
 #include "random.h"
@@ -26,6 +27,8 @@ static struct option          long_options[] = {
 	{ "config",                  required_argument, NULL, 'c' },
 	{ "port",	            required_argument, NULL, 'p' },
 	{ "listen-mode",             required_argument, NULL, 'M' }, /* long only */
+	{ "listen-doh",              no_argument,       NULL, 'H' }, /* long only */
+	{ "doh-listen-port",         required_argument, NULL, 'O' }, /* long only */
 	{ "upstream",                required_argument, NULL, 'u' },
 	{ "upstream-port",           required_argument, NULL, 'P' }, /* long only */
 	{ "upstream-tls",            no_argument,       NULL, 't' },
@@ -58,6 +61,12 @@ usage(const char *prog)
 	                "Listen port (default: 53; 853 for DoT listener)\n");
 	fprintf(stderr, "      --listen-mode M    "
 	                "Listener mode: auto, plain, or dot\n");
+	fprintf(stderr, "      --listen-doh       "
+	                "Enable HTTP/1.1 DoH listener on /dns-query\n");
+	fprintf(stderr, "      --doh-listen-port N\n"
+	                "                         "
+	                "DoH listener port (default %d when enabled)\n",
+	        DOH_SERVER_DEFAULT_PORT);
 	fprintf(stderr, "  -u, --upstream ADDR    "
 	                "Upstream DNS server IP or hostname (default: 8.8.8.8);\n"
 	                "                         "
@@ -365,8 +374,9 @@ main(int argc, char **argv)
 	uint16_t          query_class = DNS_CLASS_IN;
 
 	memset(&cfg, 0, sizeof(cfg));
-	cfg.listen_port = 53;
-	cfg.listen_mode = DNS_LISTEN_AUTO;
+	cfg.listen_port     = 53;
+	cfg.listen_mode     = DNS_LISTEN_AUTO;
+	cfg.doh_listen_port = DOH_SERVER_DEFAULT_PORT;
 	snprintf(cfg.upstream_addr, sizeof(cfg.upstream_addr), "8.8.8.8");
 	cfg.upstream_port      = 53;
 	cfg.edns_padding_block = DNS_EDNS_PADDING_DEFAULT_BLOCK;
@@ -412,6 +422,22 @@ main(int argc, char **argv)
 				return 1;
 			}
 			break;
+		case 'H':
+			cfg.listen_doh = true;
+			break;
+		case 'O': {
+			uint16_t port;
+			if (config_parse_port_u16(optarg, &port) < 0) {
+				fprintf(stderr,
+				        "error: invalid DoH listen port: %s\n",
+				        optarg);
+				return 1;
+			}
+			cfg.doh_listen_port          = (int)port;
+			cfg.doh_listen_port_explicit = true;
+			cfg.listen_doh               = true;
+			break;
+		}
 		case 'u':
 			snprintf(cfg.upstream_addr, sizeof(cfg.upstream_addr),
 			         "%s", optarg);

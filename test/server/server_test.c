@@ -17,6 +17,7 @@
 #include <openssl/ssl.h>
 
 #include "dns.h"
+#include "doh_server.h"
 #include "server.h"
 #include "wire.h"
 #include "test.h"
@@ -149,6 +150,7 @@ struct test_server {
 	int           udp_port;
 	int           tcp_port;
 	int           dot_port;
+	int           doh_port;
 };
 
 static void *
@@ -199,6 +201,7 @@ start_test_server(struct test_server *ts, const char *upstream_addr,
 	ts->udp_port = -1;
 	ts->tcp_port = -1;
 	ts->dot_port = -1;
+	ts->doh_port = -1;
 
 	if (server_init(&ts->srv, &cfg) < 0)
 		return -1;
@@ -308,6 +311,99 @@ tcp_roundtrip(int port, const uint8_t *query, size_t qlen,
 	}
 
 	ssize_t got = recv(fd, resp, rlen, MSG_WAITALL);
+	close(fd);
+	return got;
+}
+
+static int
+send_all(int fd, const uint8_t *buf, size_t len)
+{
+	size_t sent = 0;
+
+	while (sent < len) {
+		ssize_t n = send(fd, buf + sent, len - sent, 0);
+		if (n <= 0)
+			return -1;
+		sent += (size_t)n;
+	}
+	return 0;
+}
+
+static ssize_t
+doh_roundtrip(int port, const uint8_t *query, size_t qlen,
+              uint8_t *resp, size_t resp_size, int *status_code)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+
+	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+	struct sockaddr_in dst;
+	memset(&dst, 0, sizeof(dst));
+	dst.sin_family      = AF_INET;
+	dst.sin_port        = htons((uint16_t)port);
+	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	if (connect(fd, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	char header[512];
+	int  hn = snprintf(header, sizeof(header),
+	                   "POST /dns-query HTTP/1.1\r\n"
+	                   "Host: localhost\r\n"
+	                   "Accept: application/dns-message\r\n"
+	                   "Content-Type: application/dns-message\r\n"
+	                   "Content-Length: %zu\r\n"
+	                   "Connection: close\r\n"
+	                   "\r\n",
+	                   qlen);
+	if (hn < 0 || (size_t)hn >= sizeof(header) || send_all(fd, (const uint8_t *)header, (size_t)hn) < 0 || send_all(fd, query, qlen) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	char   resp_headers[2048];
+	size_t hlen = 0;
+	while (hlen + 1 < sizeof(resp_headers)) {
+		ssize_t n = recv(fd, resp_headers + hlen, 1, 0);
+		if (n != 1) {
+			close(fd);
+			return -1;
+		}
+		hlen++;
+		if (hlen >= 4 && resp_headers[hlen - 4] == '\r' && resp_headers[hlen - 3] == '\n' && resp_headers[hlen - 2] == '\r' && resp_headers[hlen - 1] == '\n')
+			break;
+	}
+	resp_headers[hlen] = '\0';
+
+	int status         = 0;
+	if (sscanf(resp_headers, "HTTP/1.%*d %d", &status) != 1) {
+		close(fd);
+		return -1;
+	}
+	*status_code      = status;
+
+	const char *ctype = strstr(resp_headers,
+	                           "Content-Type: application/dns-message");
+	const char *clen  = strstr(resp_headers, "Content-Length:");
+	if (status != DOH_HTTP_OK || ctype == NULL || clen == NULL) {
+		close(fd);
+		return -1;
+	}
+
+	size_t body_len = (size_t)strtoul(clen + strlen("Content-Length:"),
+	                                  NULL, 10);
+	if (body_len == 0 || body_len > resp_size) {
+		close(fd);
+		return -1;
+	}
+
+	ssize_t got = recv(fd, resp, body_len, MSG_WAITALL);
 	close(fd);
 	return got;
 }
@@ -1159,12 +1255,41 @@ start_dot_test_server(struct test_server *ts, const char *upstream_addr,
 	ts->udp_port = -1;
 	ts->tcp_port = -1;
 	ts->dot_port = -1;
+	ts->doh_port = -1;
 
 	if (server_init(&ts->srv, &cfg) < 0)
 		return -1;
 
 	ts->dot_port = get_bound_port(ts->srv.dot_fd);
 	if (ts->dot_port < 0)
+		return -1;
+
+	if (pthread_create(&ts->thread, NULL, run_thread, &ts->srv) != 0)
+		return -1;
+
+	return 0;
+}
+
+static int
+start_doh_test_server(struct test_server *ts, const char *upstream_addr,
+                      int upstream_port)
+{
+	struct dns_config cfg;
+	init_server_config(&cfg, upstream_addr, upstream_port);
+	cfg.listen_doh      = true;
+	cfg.doh_listen_port = 0;
+
+	memset(ts, 0, sizeof(*ts));
+	ts->udp_port = -1;
+	ts->tcp_port = -1;
+	ts->dot_port = -1;
+	ts->doh_port = -1;
+
+	if (server_init(&ts->srv, &cfg) < 0)
+		return -1;
+
+	ts->doh_port = get_bound_port(ts->srv.doh_fd);
+	if (ts->doh_port < 0)
 		return -1;
 
 	if (pthread_create(&ts->thread, NULL, run_thread, &ts->srv) != 0)
@@ -1251,6 +1376,27 @@ test_auto_listener_doh_upstream_plain_listener(void)
 	TEST_CHECK(srv.tcp_fd >= 0);
 	TEST_CHECK(srv.dot_fd < 0);
 	TEST_EXPECT_INT_EQ(srv.config.listen_mode, DNS_LISTEN_PLAIN);
+
+	server_stop(&srv);
+}
+
+static void
+test_listen_doh_adds_independent_listener(void)
+{
+	struct dns_config cfg;
+	struct server     srv;
+
+	init_server_config(&cfg, "127.0.0.1", 53);
+	cfg.listen_doh      = true;
+	cfg.doh_listen_port = 0;
+
+	TEST_CHECK(server_init(&srv, &cfg) == 0);
+	TEST_CHECK(srv.sock_fd >= 0);
+	TEST_CHECK(srv.tcp_fd >= 0);
+	TEST_CHECK(srv.dot_fd < 0);
+	TEST_CHECK(srv.doh_fd >= 0);
+	TEST_EXPECT_INT_EQ(srv.config.listen_mode, DNS_LISTEN_PLAIN);
+	TEST_CHECK(srv.config.listen_doh);
 
 	server_stop(&srv);
 }
@@ -1383,6 +1529,34 @@ test_dot_listener_autocert(void)
 	stop_test_server(&ts);
 }
 
+static void
+test_doh_forwarded_query_basic(void)
+{
+	struct mock_upstream up;
+	TEST_CHECK(start_mock_upstream(&up, 0x0A141E28, 180) == 0);
+
+	struct test_server ts;
+	TEST_CHECK(start_doh_test_server(&ts, "127.0.0.1", up.port) == 0);
+
+	uint8_t query[DNS_MAX_MSG_SIZE];
+	uint8_t resp[DNS_MAX_MSG_SIZE];
+	size_t  qlen   = make_query(query, 0xD011, "doh.example",
+	                            DNS_TYPE_A, DNS_CLASS_IN);
+	int     status = 0;
+
+	ssize_t rlen   = doh_roundtrip(ts.doh_port, query, qlen,
+	                               resp, sizeof(resp), &status);
+	TEST_EXPECT_INT_EQ(status, DOH_HTTP_OK);
+	TEST_CHECK(rlen >= DNS_HEADER_SIZE);
+	TEST_CHECK(get_u16(resp) == 0xD011);
+	TEST_CHECK((get_u16(resp + 2) & DNS_FLAG_QR) != 0);
+	TEST_CHECK((get_u16(resp + 2) & DNS_FLAGS_RCODE_MASK) == DNS_RCODE_OK);
+	TEST_CHECK(get_u16(resp + 6) == 1);
+
+	stop_test_server(&ts);
+	stop_mock_upstream(&up);
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                                 */
 /* ------------------------------------------------------------------ */
@@ -1407,7 +1581,9 @@ main(void)
 	test_explicit_dot_listener_with_doh_upstream();
 	test_auto_listener_legacy_dot_upstream();
 	test_auto_listener_doh_upstream_plain_listener();
+	test_listen_doh_adds_independent_listener();
 	test_dot_listener_autocert();
+	test_doh_forwarded_query_basic();
 
 	puts("server tests passed");
 	return 0;

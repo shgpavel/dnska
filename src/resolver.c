@@ -30,6 +30,8 @@ enum {
 	RESOLVER_BIND_RETRIES         = 64,
 	RESOLVER_TIMEOUT_SEC          = 3,
 	RESOLVER_ID_MISMATCH_LIMIT    = 3,
+	RESOLVER_TLS_POOL_SIZE        = 4,
+	RESOLVER_TLS_NAME_SIZE        = 256,
 	RESOLVER_DNS_TYPE_SVCB        = 64,
 	RESOLVER_EDNS_OPTION_PADDING  = 12,
 	RESOLVER_SVCB_PARAM_MANDATORY = 0,
@@ -41,10 +43,33 @@ enum {
 static SSL_CTX       *client_tls_ctx;
 static pthread_once_t client_tls_once = PTHREAD_ONCE_INIT;
 
+struct resolver_tls_pool_entry {
+	bool                    active;
+	bool                    busy;
+	int                     fd;
+	SSL                    *ssl;
+	struct sockaddr_storage upstream;
+	socklen_t               upstream_len;
+	int                     family;
+	char                    tls_name[RESOLVER_TLS_NAME_SIZE];
+	unsigned long           last_used;
+};
+
+struct resolver_tls_conn {
+	struct resolver_tls_pool_entry *entry;
+	int                             fd;
+	SSL                            *ssl;
+	bool                            reused;
+};
+
+static pthread_mutex_t                tls_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct resolver_tls_pool_entry tls_pool[RESOLVER_TLS_POOL_SIZE];
+static unsigned long                  tls_pool_clock;
+
 /* Configured via resolver_set_tls_config(); read-only after init. */
-static char           tls_ca_file[256];
-static char           tls_auth_name[256];
-static bool           tls_insecure;
+static char                           tls_ca_file[256];
+static char                           tls_auth_name[256];
+static bool                           tls_insecure;
 
 void
 resolver_set_tls_config(const char *ca_file, const char *auth_name,
@@ -364,6 +389,191 @@ tls_connect(const struct sockaddr *upstream, socklen_t upstream_len,
 	return 0;
 }
 
+static bool
+tls_pool_name(const char *hostname, char *out, size_t out_size)
+{
+	const char *name = "";
+
+	if (tls_auth_name[0] != '\0')
+		name = tls_auth_name;
+	else if (hostname != NULL && hostname[0] != '\0')
+		name = hostname;
+
+	if (strlen(name) >= out_size)
+		return false;
+	snprintf(out, out_size, "%s", name);
+	return true;
+}
+
+static bool
+tls_pool_entry_matches(const struct resolver_tls_pool_entry *entry,
+                       const struct sockaddr                *upstream,
+                       socklen_t upstream_len, int family,
+                       const char *tls_name)
+{
+	return entry->active
+	       && !entry->busy
+	       && entry->family == family
+	       && entry->upstream_len == upstream_len
+	       && strcmp(entry->tls_name, tls_name) == 0
+	       && memcmp(&entry->upstream, upstream, upstream_len) == 0;
+}
+
+static void
+tls_pool_prepare_entry(struct resolver_tls_pool_entry *entry,
+                       const struct sockaddr          *upstream,
+                       socklen_t upstream_len, int family,
+                       const char *tls_name)
+{
+	entry->active       = false;
+	entry->busy         = true;
+	entry->fd           = -1;
+	entry->ssl          = NULL;
+	entry->upstream_len = upstream_len;
+	entry->family       = family;
+	memset(&entry->upstream, 0, sizeof(entry->upstream));
+	memcpy(&entry->upstream, upstream, upstream_len);
+	snprintf(entry->tls_name, sizeof(entry->tls_name), "%s", tls_name);
+	entry->last_used = ++tls_pool_clock;
+}
+
+static struct resolver_tls_pool_entry *
+tls_pool_pick_entry_locked(const struct sockaddr *upstream,
+                           socklen_t upstream_len, int family,
+                           const char *tls_name, SSL **old_ssl,
+                           int *old_fd)
+{
+	struct resolver_tls_pool_entry *oldest = NULL;
+
+	*old_ssl                               = NULL;
+	*old_fd                                = -1;
+
+	for (size_t i = 0; i < RESOLVER_TLS_POOL_SIZE; i++) {
+		if (!tls_pool[i].active && !tls_pool[i].busy) {
+			tls_pool_prepare_entry(&tls_pool[i], upstream,
+			                       upstream_len, family,
+			                       tls_name);
+			return &tls_pool[i];
+		}
+	}
+
+	for (size_t i = 0; i < RESOLVER_TLS_POOL_SIZE; i++) {
+		if (tls_pool[i].busy)
+			continue;
+		if (oldest == NULL
+		    || tls_pool[i].last_used < oldest->last_used)
+			oldest = &tls_pool[i];
+	}
+
+	if (oldest == NULL)
+		return NULL;
+
+	*old_ssl = oldest->ssl;
+	*old_fd  = oldest->fd;
+	tls_pool_prepare_entry(oldest, upstream, upstream_len, family,
+	                       tls_name);
+	return oldest;
+}
+
+static int
+tls_pool_checkout(const struct sockaddr *upstream, socklen_t upstream_len,
+                  int family, const char *hostname,
+                  struct resolver_tls_conn *conn)
+{
+	char tls_name[RESOLVER_TLS_NAME_SIZE];
+
+	conn->entry  = NULL;
+	conn->fd     = -1;
+	conn->ssl    = NULL;
+	conn->reused = false;
+
+	if (upstream_len > sizeof(struct sockaddr_storage)
+	    || !tls_pool_name(hostname, tls_name, sizeof(tls_name)))
+		return tls_connect(upstream, upstream_len, family, hostname,
+		                   &conn->fd, &conn->ssl);
+
+	pthread_mutex_lock(&tls_pool_lock);
+	for (size_t i = 0; i < RESOLVER_TLS_POOL_SIZE; i++) {
+		if (tls_pool_entry_matches(&tls_pool[i], upstream,
+		                           upstream_len, family,
+		                           tls_name)) {
+			tls_pool[i].busy = true;
+			conn->entry      = &tls_pool[i];
+			conn->fd         = tls_pool[i].fd;
+			conn->ssl        = tls_pool[i].ssl;
+			conn->reused     = true;
+			pthread_mutex_unlock(&tls_pool_lock);
+			return 0;
+		}
+	}
+
+	SSL                            *old_ssl = NULL;
+	int                             old_fd  = -1;
+	struct resolver_tls_pool_entry *entry   = tls_pool_pick_entry_locked(upstream, upstream_len, family,
+	                                                                     tls_name, &old_ssl, &old_fd);
+	pthread_mutex_unlock(&tls_pool_lock);
+
+	if (entry == NULL)
+		return tls_connect(upstream, upstream_len, family, hostname,
+		                   &conn->fd, &conn->ssl);
+
+	tls_close(old_ssl, old_fd);
+
+	int  fd  = -1;
+	SSL *ssl = NULL;
+	if (tls_connect(upstream, upstream_len, family, hostname, &fd,
+	                &ssl)
+	    < 0) {
+		pthread_mutex_lock(&tls_pool_lock);
+		entry->active = false;
+		entry->busy   = false;
+		entry->fd     = -1;
+		entry->ssl    = NULL;
+		pthread_mutex_unlock(&tls_pool_lock);
+		return -1;
+	}
+
+	pthread_mutex_lock(&tls_pool_lock);
+	entry->active = true;
+	entry->busy   = true;
+	entry->fd     = fd;
+	entry->ssl    = ssl;
+	conn->entry   = entry;
+	conn->fd      = fd;
+	conn->ssl     = ssl;
+	pthread_mutex_unlock(&tls_pool_lock);
+	return 0;
+}
+
+static void
+tls_pool_release(struct resolver_tls_conn *conn, bool keep)
+{
+	if (conn->entry == NULL) {
+		tls_close(conn->ssl, conn->fd);
+		return;
+	}
+
+	SSL *close_ssl = NULL;
+	int  close_fd  = -1;
+
+	pthread_mutex_lock(&tls_pool_lock);
+	if (keep && conn->entry->ssl == conn->ssl && conn->entry->fd == conn->fd) {
+		conn->entry->busy      = false;
+		conn->entry->last_used = ++tls_pool_clock;
+	} else {
+		close_ssl                = conn->entry->ssl;
+		close_fd                 = conn->entry->fd;
+		conn->entry->active      = false;
+		conn->entry->busy        = false;
+		conn->entry->fd          = -1;
+		conn->entry->ssl         = NULL;
+		conn->entry->tls_name[0] = '\0';
+	}
+	pthread_mutex_unlock(&tls_pool_lock);
+
+	tls_close(close_ssl, close_fd);
+}
+
 /*
  * Forward query to upstream over DNS-over-TLS (RFC 7858).
  * Uses TCP with a TLS layer; same length-prefix framing as DNS-over-TCP.
@@ -376,62 +586,85 @@ forward_tls(const struct sockaddr *upstream, socklen_t upstream_len,
             uint8_t *response, size_t response_size,
             size_t *response_len)
 {
-	uint8_t len_buf[2];
-	SSL    *ssl = NULL;
-	int     fd  = -1;
-
-	if (tls_connect(upstream, upstream_len, family, hostname, &fd, &ssl) < 0)
+	if (query_len > UINT16_MAX)
 		return -1;
 
-	if (query_len > UINT16_MAX) {
-		tls_close(ssl, fd);
-		return -1;
+	for (int attempt = 0; attempt < 2; attempt++) {
+		struct resolver_tls_conn conn;
+		uint8_t                  len_buf[2];
+
+		if (tls_pool_checkout(upstream, upstream_len, family,
+		                      hostname, &conn)
+		    < 0)
+			return -1;
+
+		len_buf[0] = (uint8_t)(query_len >> 8);
+		len_buf[1] = (uint8_t)query_len;
+
+		if (ssl_writen(conn.ssl, len_buf, 2) < 0
+		    || ssl_writen(conn.ssl, query, query_len) < 0) {
+			fprintf(stderr, "resolver: TLS send: %s\n",
+			        strerror(errno));
+			bool retry = conn.reused && attempt == 0;
+			tls_pool_release(&conn, false);
+			if (retry)
+				continue;
+			return -1;
+		}
+
+		if (ssl_readn(conn.ssl, len_buf, 2) < 0) {
+			fprintf(stderr, "resolver: TLS recv length: %s\n",
+			        strerror(errno));
+			bool retry = conn.reused && attempt == 0;
+			tls_pool_release(&conn, false);
+			if (retry)
+				continue;
+			return -1;
+		}
+
+		size_t resp_size = (size_t)(((uint16_t)len_buf[0] << 8)
+		                            | len_buf[1]);
+		if (resp_size < DNS_HEADER_SIZE || resp_size > response_size) {
+			fprintf(stderr, "resolver: TLS bad response length: %zu\n",
+			        resp_size);
+			bool retry = conn.reused && attempt == 0;
+			tls_pool_release(&conn, false);
+			if (retry)
+				continue;
+			return -1;
+		}
+
+		if (ssl_readn(conn.ssl, response, resp_size) < 0) {
+			fprintf(stderr, "resolver: TLS recv body: %s\n",
+			        strerror(errno));
+			bool retry = conn.reused && attempt == 0;
+			tls_pool_release(&conn, false);
+			if (retry)
+				continue;
+			return -1;
+		}
+
+		uint16_t got_id = (uint16_t)(((uint16_t)response[0] << 8)
+		                             | response[1]);
+		if (got_id != upstream_id) {
+			fprintf(stderr, "resolver: TLS response ID mismatch\n");
+			bool retry = conn.reused && attempt == 0;
+			tls_pool_release(&conn, false);
+			if (retry)
+				continue;
+			return -1;
+		}
+
+		tls_pool_release(&conn, true);
+
+		response[0]   = orig_query[0];
+		response[1]   = orig_query[1];
+
+		*response_len = resp_size;
+		return 0;
 	}
-	len_buf[0] = (uint8_t)(query_len >> 8);
-	len_buf[1] = (uint8_t)query_len;
 
-	if (ssl_writen(ssl, len_buf, 2) < 0
-	    || ssl_writen(ssl, query, query_len) < 0) {
-		fprintf(stderr, "resolver: TLS send: %s\n", strerror(errno));
-		tls_close(ssl, fd);
-		return -1;
-	}
-
-	if (ssl_readn(ssl, len_buf, 2) < 0) {
-		fprintf(stderr, "resolver: TLS recv length: %s\n",
-		        strerror(errno));
-		tls_close(ssl, fd);
-		return -1;
-	}
-
-	size_t resp_size = (size_t)(((uint16_t)len_buf[0] << 8) | len_buf[1]);
-	if (resp_size < DNS_HEADER_SIZE || resp_size > response_size) {
-		fprintf(stderr, "resolver: TLS bad response length: %zu\n",
-		        resp_size);
-		tls_close(ssl, fd);
-		return -1;
-	}
-
-	if (ssl_readn(ssl, response, resp_size) < 0) {
-		fprintf(stderr, "resolver: TLS recv body: %s\n",
-		        strerror(errno));
-		tls_close(ssl, fd);
-		return -1;
-	}
-
-	tls_close(ssl, fd);
-
-	uint16_t got_id = (uint16_t)(((uint16_t)response[0] << 8) | response[1]);
-	if (got_id != upstream_id) {
-		fprintf(stderr, "resolver: TLS response ID mismatch\n");
-		return -1;
-	}
-
-	response[0]   = orig_query[0];
-	response[1]   = orig_query[1];
-
-	*response_len = resp_size;
-	return 0;
+	return -1;
 }
 
 /*

@@ -659,6 +659,149 @@ test_dot_edns_padding_updates_existing_opt(void)
 	TEST_EXPECT_INT_EQ(wire_read_u16(response), 0xBEEF);
 }
 
+struct dot_reuse_fixture {
+	int      fd;
+	SSL_CTX *ctx;
+	uint16_t port;
+	int      accepted_connections;
+	uint8_t  received_query[2][DNS_MAX_MSG_SIZE];
+	size_t   received_len[2];
+};
+
+static void *
+serve_dot_reuse(void *arg)
+{
+	struct dot_reuse_fixture *fixture = arg;
+	struct sockaddr_in        client_addr;
+	socklen_t                 client_len = sizeof(client_addr);
+	int                       conn;
+	SSL                      *ssl;
+	uint8_t                   len_buf[2];
+	uint8_t                   response[DNS_MAX_MSG_SIZE];
+
+	conn = accept(fixture->fd, (struct sockaddr *)&client_addr,
+	              &client_len);
+	TEST_CHECK(conn >= 0);
+	fixture->accepted_connections++;
+
+	ssl = SSL_new(fixture->ctx);
+	TEST_CHECK(ssl != NULL);
+	TEST_CHECK(SSL_set_fd(ssl, conn) == 1);
+	TEST_CHECK(SSL_accept(ssl) > 0);
+
+	for (size_t i = 0; i < 2; i++) {
+		TEST_CHECK(ssl_read_exact(ssl, len_buf, 2) == 0);
+		fixture->received_len[i] = (size_t)(((uint16_t)len_buf[0] << 8) | len_buf[1]);
+		TEST_CHECK(fixture->received_len[i]
+		           <= sizeof(fixture->received_query[i]));
+		TEST_CHECK(ssl_read_exact(ssl, fixture->received_query[i],
+		                          fixture->received_len[i])
+		           == 0);
+
+		memcpy(response, fixture->received_query[i],
+		       fixture->received_len[i]);
+		write_u16(response + 2,
+		          DNS_FLAG_QR | DNS_FLAG_RA | (wire_read_u16(response + 2) & DNS_FLAG_RD));
+		len_buf[0] = (uint8_t)(fixture->received_len[i] >> 8);
+		len_buf[1] = (uint8_t)fixture->received_len[i];
+		TEST_CHECK(ssl_write_exact(ssl, len_buf, 2) == 0);
+		TEST_CHECK(ssl_write_exact(ssl, response,
+		                           fixture->received_len[i])
+		           == 0);
+	}
+
+	SSL_free(ssl);
+	close(conn);
+	return NULL;
+}
+
+static void
+test_dot_tls_connection_reused_and_padding_is_per_query(void)
+{
+	struct dot_reuse_fixture fixture;
+	struct sockaddr_in       addr;
+	socklen_t                addr_len = sizeof(addr);
+	pthread_t                thread;
+	uint8_t                  query1[DNS_MAX_MSG_SIZE];
+	uint8_t                  query2[DNS_MAX_MSG_SIZE];
+	uint8_t                  response[DNS_MAX_MSG_SIZE];
+	size_t                   query1_len;
+	size_t                   query2_len;
+	size_t                   response_len = 0;
+	uint16_t                 padding_len1 = 0;
+	uint16_t                 padding_len2 = 0;
+
+	memset(&fixture, 0, sizeof(fixture));
+	fixture.fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fixture.fd < 0 && (errno == EPERM || errno == EACCES))
+		TEST_SKIP("resolver tests skipped: TCP sockets unavailable");
+	TEST_CHECK(fixture.fd >= 0);
+
+	int optval = 1;
+	setsockopt(fixture.fd, SOL_SOCKET, SO_REUSEADDR,
+	           &optval, sizeof(optval));
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family      = AF_INET;
+	addr.sin_port        = 0;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	TEST_CHECK(bind(fixture.fd, (struct sockaddr *)&addr, sizeof(addr))
+	           == 0);
+	TEST_CHECK(getsockname(fixture.fd, (struct sockaddr *)&addr,
+	                       &addr_len)
+	           == 0);
+	TEST_CHECK(listen(fixture.fd, 1) == 0);
+	fixture.port = ntohs(addr.sin_port);
+
+	fixture.ctx  = SSL_CTX_new(TLS_server_method());
+	TEST_CHECK(fixture.ctx != NULL);
+	SSL_CTX_set_min_proto_version(fixture.ctx, TLS1_2_VERSION);
+	TEST_CHECK(make_selfsigned_cert(fixture.ctx) == 0);
+
+	TEST_CHECK(pthread_create(&thread, NULL, serve_dot_reuse,
+	                          &fixture)
+	           == 0);
+
+	resolver_set_tls_config(NULL, NULL, true);
+
+	query1_len = make_query(query1, 0x1111, DNS_FLAG_RD, "example.com");
+	query2_len = make_query(query2, 0x2222, DNS_FLAG_RD, "example.com");
+	query2_len = append_test_opt(query2, query2_len);
+
+	char addrs[1][INET6_ADDRSTRLEN];
+	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
+	int rc1 = resolver_forward(addrs, 1, fixture.port, true, false,
+	                           NULL, "localhost", 128,
+	                           query1, query1_len,
+	                           response, sizeof(response),
+	                           &response_len);
+	int rc2 = resolver_forward(addrs, 1, fixture.port, true, false,
+	                           NULL, "localhost", 128,
+	                           query2, query2_len,
+	                           response, sizeof(response),
+	                           &response_len);
+
+	TEST_CHECK(pthread_join(thread, NULL) == 0);
+	close(fixture.fd);
+	SSL_CTX_free(fixture.ctx);
+
+	TEST_EXPECT_INT_EQ(rc1, 0);
+	TEST_EXPECT_INT_EQ(rc2, 0);
+	TEST_EXPECT_INT_EQ(fixture.accepted_connections, 1);
+	TEST_CHECK(fixture.received_len[0] > query1_len);
+	TEST_CHECK(fixture.received_len[1] > query2_len);
+	TEST_EXPECT_SIZE_EQ(fixture.received_len[0] % 128, 0);
+	TEST_EXPECT_SIZE_EQ(fixture.received_len[1] % 128, 0);
+	TEST_CHECK(find_padding_option(fixture.received_query[0],
+	                               fixture.received_len[0],
+	                               &padding_len1));
+	TEST_CHECK(find_padding_option(fixture.received_query[1],
+	                               fixture.received_len[1],
+	                               &padding_len2));
+	TEST_EXPECT_INT_EQ(padding_len1, 84);
+	TEST_EXPECT_INT_EQ(padding_len2, 78);
+}
+
 static void
 test_plain_udp_does_not_add_edns_padding(void)
 {
@@ -1236,6 +1379,7 @@ main(void)
 	test_0x20_randomization_uppercase_present();
 	test_dot_edns_padding_block_128();
 	test_dot_edns_padding_updates_existing_opt();
+	test_dot_tls_connection_reused_and_padding_is_per_query();
 	test_plain_udp_does_not_add_edns_padding();
 	test_tcp_fallback_on_truncation();
 	test_multi_addr_failover_skips_dead_first();

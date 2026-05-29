@@ -12,6 +12,11 @@
 ;   dot   - DoT listener regardless of upstream transport
 ;listen_mode = auto
 
+; Add an independent HTTP/1.1 DoH listener for POST /dns-query.  This
+; listener is cleartext HTTP; terminate TLS in front for public HTTPS DoH.
+;listen_doh = false
+;doh_listen_port = 8053
+
 ; Upstream resolver.  Either an IP literal or a hostname.  A hostname
 ; implies DoT (port 853 default) unless --upstream-doh is also set, in
 ; which case DoH is used (port 443 default).

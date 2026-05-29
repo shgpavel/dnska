@@ -74,6 +74,21 @@ append_question(uint8_t *buf, size_t pos, const char *name, uint16_t qtype)
 }
 
 static size_t
+append_compressed_rr(uint8_t *buf, size_t pos, uint16_t owner_ptr,
+                     uint16_t type, const uint8_t *rdata, uint16_t rdlen)
+{
+	buf[pos++] = (uint8_t)(0xC0 | (owner_ptr >> 8));
+	buf[pos++] = (uint8_t)owner_ptr;
+	write_u16(buf + pos, type);
+	write_u16(buf + pos + 2, DNS_CLASS_IN);
+	write_u32(buf + pos + 4, 600);
+	write_u16(buf + pos + 8, rdlen);
+	pos += 10;
+	memcpy(buf + pos, rdata, rdlen);
+	return pos + rdlen;
+}
+
+static size_t
 make_response(uint8_t *buf, uint16_t ancount)
 {
 	memset(buf, 0, DNS_HEADER_SIZE);
@@ -103,6 +118,78 @@ make_rrsig_rdata(uint8_t *buf)
 	buf[pos++]  = 0xBE;
 	buf[pos++]  = 0xEF;
 	return pos;
+}
+
+static void
+test_canonical_name_and_rr_helpers(void)
+{
+	uint8_t name[DNS_MAX_NAME_LEN + 1];
+	uint8_t expected[] = {
+		7,
+		'e',
+		'x',
+		'a',
+		'm',
+		'p',
+		'l',
+		'e',
+		3,
+		'c',
+		'o',
+		'm',
+		0,
+	};
+	uint8_t                    buf[128];
+	uint8_t                    rdata[4] = { 192, 0, 2, 55 };
+	size_t                     name_len = 0;
+	size_t                     consumed = 0;
+	size_t                     rr_len   = 0;
+	size_t                     pos      = 0;
+	struct dnssec_canonical_rr rr_a;
+	struct dnssec_canonical_rr rr_b;
+
+	assert(dnssec_canonical_name_from_text("Example.COM.", name,
+	                                       sizeof(name), &name_len)
+	       == DNSSEC_OK);
+	assert(name_len == sizeof(expected));
+	assert(memcmp(name, expected, sizeof(expected)) == 0);
+
+	assert(dnssec_canonical_name_from_text(".", name, sizeof(name),
+	                                       &name_len)
+	       == DNSSEC_OK);
+	assert(name_len == 1);
+	assert(name[0] == 0);
+
+	pos = append_name(buf, 0, "Example.COM");
+	pos = append_compressed_rr(buf, pos, 0, DNS_TYPE_A, rdata,
+	                           sizeof(rdata));
+
+	assert(dnssec_canonical_name_from_wire(buf, pos, 13, name,
+	                                       sizeof(name), &name_len,
+	                                       &consumed)
+	       == DNSSEC_OK);
+	assert(consumed == 2);
+	assert(name_len == sizeof(expected));
+	assert(memcmp(name, expected, sizeof(expected)) == 0);
+
+	assert(dnssec_parse_canonical_rr(buf, pos, 13, &rr_a, &rr_len)
+	       == DNSSEC_OK);
+	assert(rr_len == 16);
+	assert(rr_a.type == DNS_TYPE_A);
+	assert(rr_a.rrclass == DNS_CLASS_IN);
+	assert(rr_a.ttl == 600);
+	assert(rr_a.rdata_len == sizeof(rdata));
+	assert(memcmp(rr_a.rdata, rdata, sizeof(rdata)) == 0);
+
+	pos = append_name(buf, 0, "example.com");
+	pos = append_rr(buf, pos, "EXAMPLE.COM", DNS_TYPE_A, rdata,
+	                sizeof(rdata));
+	assert(dnssec_parse_canonical_rr(buf, pos, 13, &rr_b, NULL)
+	       == DNSSEC_OK);
+	assert(dnssec_canonical_rr_same_rrset(&rr_a, &rr_b));
+
+	rr_b.type = DNS_TYPE_AAAA;
+	assert(!dnssec_canonical_rr_same_rrset(&rr_a, &rr_b));
 }
 
 static void
@@ -190,13 +277,54 @@ test_ds_matches_dnskey_sha256(void)
 	assert(!matches);
 
 	ds_rdata[9] ^= 0x80;
-	ds_rdata[3]  = DNSSEC_DS_DIGEST_SHA384;
+	ds_rdata[3]  = DNSSEC_DS_DIGEST_SHA1;
 	assert(dnssec_parse_ds(ds_rdata, 4 + digest_len, &ds) == DNSSEC_OK);
 	assert(dnssec_ds_matches_dnskey("example.com", &ds, &dnskey,
 	                                dnskey_rdata,
 	                                sizeof(dnskey_rdata),
 	                                &matches)
 	       == DNSSEC_ERR_UNSUPPORTED);
+}
+
+static void
+test_ds_matches_dnskey_sha384(void)
+{
+	uint8_t dnskey_rdata[36] = { 0x01, 0x01, 0x03,
+		                     DNSSEC_ALGORITHM_ECDSAP256SHA256 };
+	uint8_t digest[DNSSEC_MAX_DS_DIGEST_LEN];
+	uint8_t ds_rdata[4 + DNSSEC_MAX_DS_DIGEST_LEN];
+	size_t  digest_len = 0;
+	bool    matches    = false;
+
+	for (size_t i = 4; i < sizeof(dnskey_rdata); i++)
+		dnskey_rdata[i] = (uint8_t)(0xF0 - i);
+
+	assert(dnssec_dnskey_ds_digest("Example.COM.", dnskey_rdata,
+	                               sizeof(dnskey_rdata),
+	                               DNSSEC_DS_DIGEST_SHA384,
+	                               digest, sizeof(digest),
+	                               &digest_len)
+	       == DNSSEC_OK);
+	assert(digest_len == 48);
+
+	write_u16(ds_rdata, dnssec_dnskey_key_tag(dnskey_rdata,
+	                                          sizeof(dnskey_rdata)));
+	ds_rdata[2] = DNSSEC_ALGORITHM_ECDSAP256SHA256;
+	ds_rdata[3] = DNSSEC_DS_DIGEST_SHA384;
+	memcpy(ds_rdata + 4, digest, digest_len);
+
+	struct dnssec_ds     ds;
+	struct dnssec_dnskey dnskey;
+	assert(dnssec_parse_ds(ds_rdata, 4 + digest_len, &ds) == DNSSEC_OK);
+	assert(dnssec_parse_dnskey(dnskey_rdata, sizeof(dnskey_rdata),
+	                           &dnskey)
+	       == DNSSEC_OK);
+	assert(dnssec_ds_matches_dnskey("example.com", &ds, &dnskey,
+	                                dnskey_rdata,
+	                                sizeof(dnskey_rdata),
+	                                &matches)
+	       == DNSSEC_OK);
+	assert(matches);
 }
 
 static void
@@ -274,6 +402,100 @@ test_parse_rrsig_nsec_nsec3(void)
 }
 
 static void
+test_type_bitmap_multi_window(void)
+{
+	static const uint8_t bitmap[] = {
+		0,
+		1,
+		0x40, /* TYPE1 / A */
+		1,
+		1,
+		0x40, /* TYPE257 / CAA */
+		2,
+		1,
+		0x80, /* TYPE512 */
+	};
+	static const uint8_t duplicate_window[] = {
+		0,
+		1,
+		0x40,
+		0,
+		1,
+		0x80,
+	};
+	static const uint8_t zero_length_window[] = {
+		0,
+		0,
+	};
+
+	assert(dnssec_type_bitmap_is_well_formed(bitmap, sizeof(bitmap)));
+	assert(dnssec_type_bitmap_has_type(bitmap, sizeof(bitmap), DNS_TYPE_A));
+	assert(dnssec_type_bitmap_has_type(bitmap, sizeof(bitmap), DNS_TYPE_CAA));
+	assert(dnssec_type_bitmap_has_type(bitmap, sizeof(bitmap), 512));
+	assert(!dnssec_type_bitmap_has_type(bitmap, sizeof(bitmap), DNS_TYPE_AAAA));
+	assert(!dnssec_type_bitmap_has_type(bitmap, sizeof(bitmap), 258));
+	assert(!dnssec_type_bitmap_is_well_formed(duplicate_window,
+	                                          sizeof(duplicate_window)));
+	assert(!dnssec_type_bitmap_is_well_formed(zero_length_window,
+	                                          sizeof(zero_length_window)));
+}
+
+static void
+test_parse_tlsa_and_dane_precheck(void)
+{
+	uint8_t                      tlsa_rdata[3 + 64];
+	struct dnssec_tlsa           tlsa;
+	enum dnssec_validation_state dane_state;
+
+	memset(tlsa_rdata, 0x5A, sizeof(tlsa_rdata));
+	tlsa_rdata[0] = DNSSEC_TLSA_USAGE_DANE_EE;
+	tlsa_rdata[1] = DNSSEC_TLSA_SELECTOR_SPKI;
+	tlsa_rdata[2] = DNSSEC_TLSA_MATCHING_SHA256;
+
+	assert(dnssec_parse_tlsa(tlsa_rdata, 3 + 32, &tlsa) == DNSSEC_OK);
+	assert(tlsa.certificate_usage == DNSSEC_TLSA_USAGE_DANE_EE);
+	assert(tlsa.selector == DNSSEC_TLSA_SELECTOR_SPKI);
+	assert(tlsa.matching_type == DNSSEC_TLSA_MATCHING_SHA256);
+	assert(tlsa.association_data_len == 32);
+	assert(tlsa.association_data[0] == 0x5A);
+
+	assert(dnssec_parse_tlsa(tlsa_rdata, 3 + 31, &tlsa)
+	       == DNSSEC_ERR_MALFORMED);
+	tlsa_rdata[2] = DNSSEC_TLSA_MATCHING_SHA512;
+	assert(dnssec_parse_tlsa(tlsa_rdata, sizeof(tlsa_rdata), &tlsa)
+	       == DNSSEC_OK);
+	assert(tlsa.association_data_len == 64);
+	tlsa_rdata[0] = 4;
+	assert(dnssec_parse_tlsa(tlsa_rdata, sizeof(tlsa_rdata), &tlsa)
+	       == DNSSEC_ERR_UNSUPPORTED);
+
+	assert(dnssec_dane_tlsa_precheck(DNSSEC_VALIDATION_SECURE, true,
+	                                 &dane_state)
+	       == DNSSEC_OK);
+	assert(dane_state == DNSSEC_VALIDATION_SECURE);
+	assert(dnssec_dane_tlsa_precheck(DNSSEC_VALIDATION_INSECURE, true,
+	                                 &dane_state)
+	       == DNSSEC_OK);
+	assert(dane_state == DNSSEC_VALIDATION_INSECURE);
+	assert(dnssec_dane_tlsa_precheck(DNSSEC_VALIDATION_UNCHECKED, true,
+	                                 &dane_state)
+	       == DNSSEC_OK);
+	assert(dane_state == DNSSEC_VALIDATION_INSECURE);
+	assert(dnssec_dane_tlsa_precheck(DNSSEC_VALIDATION_INDETERMINATE, true,
+	                                 &dane_state)
+	       == DNSSEC_OK);
+	assert(dane_state == DNSSEC_VALIDATION_INDETERMINATE);
+	assert(dnssec_dane_tlsa_precheck(DNSSEC_VALIDATION_BOGUS, true,
+	                                 &dane_state)
+	       == DNSSEC_OK);
+	assert(dane_state == DNSSEC_VALIDATION_BOGUS);
+	assert(dnssec_dane_tlsa_precheck(DNSSEC_VALIDATION_SECURE, false,
+	                                 &dane_state)
+	       == DNSSEC_OK);
+	assert(dane_state == DNSSEC_VALIDATION_INDETERMINATE);
+}
+
+static void
 test_analyze_message_states(void)
 {
 	uint8_t                         dns_msg[DNS_MAX_MSG_SIZE];
@@ -315,9 +537,13 @@ test_analyze_message_states(void)
 int
 main(void)
 {
+	test_canonical_name_and_rr_helpers();
 	test_parse_ds_and_dnskey();
 	test_ds_matches_dnskey_sha256();
+	test_ds_matches_dnskey_sha384();
 	test_parse_rrsig_nsec_nsec3();
+	test_type_bitmap_multi_window();
+	test_parse_tlsa_and_dane_precheck();
 	test_analyze_message_states();
 
 	puts("dnssec_test: ok");

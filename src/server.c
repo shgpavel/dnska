@@ -21,6 +21,7 @@
 
 #include "cache.h"
 #include "dns.h"
+#include "doh_server.h"
 #include "dnssec.h"
 #include "log.h"
 #include "random.h"
@@ -557,6 +558,10 @@ send_response(struct query_task *task, const uint8_t *response,
               size_t response_len)
 {
 	if (task->conn_fd >= 0) {
+		if (task->transport == QUERY_TRANSPORT_DOH)
+			return doh_server_send_dns_response(task->conn_fd,
+			                                    response,
+			                                    response_len);
 		if (task->tls != NULL)
 			return send_tls_response(task->tls, response,
 			                         response_len);
@@ -906,6 +911,35 @@ have_response:
 static void
 handle_query(struct query_task *task)
 {
+	if (task->transport == QUERY_TRANSPORT_DOH) {
+		struct timeval tv = { .tv_sec  = TCP_IDLE_TIMEOUT_SEC,
+			              .tv_usec = 0 };
+		if (setsockopt(task->conn_fd, SOL_SOCKET, SO_RCVTIMEO,
+		               &tv, sizeof(tv))
+		            < 0
+		    || setsockopt(task->conn_fd, SOL_SOCKET, SO_SNDTIMEO,
+		                  &tv, sizeof(tv))
+		               < 0) {
+			release_task_slot(task);
+			return;
+		}
+
+		int status_code = DOH_HTTP_BAD_REQUEST;
+		if (doh_server_read_request(task->conn_fd, "/dns-query",
+		                            task->query, sizeof(task->query),
+		                            &task->query_len,
+		                            &status_code)
+		    < 0) {
+			doh_server_send_error(task->conn_fd, status_code);
+			release_task_slot(task);
+			return;
+		}
+
+		process_dns_query(task);
+		release_task_slot(task);
+		return;
+	}
+
 	if (task->conn_fd >= 0) {
 		/*
 		 * Set the idle timeout BEFORE the TLS handshake so a slow
@@ -1128,13 +1162,14 @@ bind_tcp(int family, int port)
  * Common dispatch path for UDP and TCP queries.  Takes the mutex,
  * acquires a task slot, enqueues the task, and signals a worker.
  * query/query_len are for UDP (already received); conn_fd >= 0 and
- * query_len == 0 signals TCP (worker reads the query from conn_fd).
+ * query_len == 0 signals TCP/DoT/DoH (worker reads from conn_fd).
  * On any error conn_fd is closed before returning.
  */
 static void
 dispatch_task(struct server *srv, const uint8_t *query, size_t query_len,
               const struct sockaddr_storage *client_addr, socklen_t addr_len,
-              int sock_fd, int conn_fd, SSL_CTX *tls_ctx)
+              int sock_fd, int conn_fd, SSL_CTX *tls_ctx,
+              enum query_transport transport)
 {
 	pthread_mutex_lock(&srv->task_lock);
 
@@ -1167,6 +1202,7 @@ dispatch_task(struct server *srv, const uint8_t *query, size_t query_len,
 	task->conn_fd           = conn_fd;
 	task->tls_ctx           = tls_ctx;
 	task->tls               = NULL;
+	task->transport         = transport;
 	task->query_len         = query_len;
 	task->addr_len          = addr_len;
 	if (query && query_len > 0)
@@ -1197,7 +1233,8 @@ accept_and_dispatch_tcp(struct server *srv, int listen_fd)
 	}
 
 	/* query_len=0 signals the worker to read the query from conn_fd */
-	dispatch_task(srv, NULL, 0, &client_addr, addr_len, -1, conn_fd, NULL);
+	dispatch_task(srv, NULL, 0, &client_addr, addr_len, -1, conn_fd, NULL,
+	              QUERY_TRANSPORT_TCP);
 }
 
 static void
@@ -1216,7 +1253,26 @@ accept_and_dispatch_dot(struct server *srv, int listen_fd)
 	}
 
 	dispatch_task(srv, NULL, 0, &client_addr, addr_len, -1, conn_fd,
-	              srv->tls_ctx);
+	              srv->tls_ctx, QUERY_TRANSPORT_DOT);
+}
+
+static void
+accept_and_dispatch_doh(struct server *srv, int listen_fd)
+{
+	struct sockaddr_storage client_addr;
+	socklen_t               addr_len = sizeof(client_addr);
+	int                     conn_fd;
+
+	conn_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
+	if (conn_fd < 0) {
+		if (errno != EINTR && errno != ECONNABORTED)
+			log_msg(LOG_ERROR, "server: DoH accept: %s\n",
+			        strerror(errno));
+		return;
+	}
+
+	dispatch_task(srv, NULL, 0, &client_addr, addr_len, -1, conn_fd,
+	              NULL, QUERY_TRANSPORT_DOH);
 }
 
 static void
@@ -1240,7 +1296,7 @@ receive_and_dispatch(struct server *srv, int sock_fd)
 	}
 
 	dispatch_task(srv, query, (size_t)n, &client_addr, addr_len,
-	              sock_fd, -1, NULL);
+	              sock_fd, -1, NULL, QUERY_TRANSPORT_UDP);
 }
 
 static int
@@ -1297,6 +1353,8 @@ server_init(struct server *srv, const struct dns_config *cfg)
 	srv->tcp_fd6            = -1;
 	srv->dot_fd             = -1;
 	srv->dot_fd6            = -1;
+	srv->doh_fd             = -1;
+	srv->doh_fd6            = -1;
 	srv->tls_ctx            = NULL;
 	srv->pending_head       = 0;
 	srv->config             = *cfg;
@@ -1335,6 +1393,7 @@ server_init(struct server *srv, const struct dns_config *cfg)
 		srv->query_tasks[i].conn_fd     = -1;
 		srv->query_tasks[i].tls_ctx     = NULL;
 		srv->query_tasks[i].tls         = NULL;
+		srv->query_tasks[i].transport   = QUERY_TRANSPORT_UDP;
 	}
 
 	if (listen_mode == DNS_LISTEN_DOT) {
@@ -1432,6 +1491,43 @@ server_init(struct server *srv, const struct dns_config *cfg)
 			        cfg->listen_port, strerror(errno));
 	}
 
+	if (cfg->listen_doh) {
+		srv->doh_fd = bind_tcp(AF_INET, cfg->doh_listen_port);
+		if (srv->doh_fd < 0) {
+			log_msg(LOG_ERROR,
+			        "server: bind IPv4 DoH port %d: %s\n",
+			        cfg->doh_listen_port, strerror(errno));
+			if (srv->sock_fd >= 0)
+				close(srv->sock_fd);
+			if (srv->sock_fd6 >= 0)
+				close(srv->sock_fd6);
+			if (srv->tcp_fd >= 0)
+				close(srv->tcp_fd);
+			if (srv->tcp_fd6 >= 0)
+				close(srv->tcp_fd6);
+			if (srv->dot_fd >= 0)
+				close(srv->dot_fd);
+			if (srv->dot_fd6 >= 0)
+				close(srv->dot_fd6);
+			if (srv->doh_fd >= 0)
+				close(srv->doh_fd);
+			if (srv->doh_fd6 >= 0)
+				close(srv->doh_fd6);
+			if (srv->tls_ctx != NULL)
+				SSL_CTX_free(srv->tls_ctx);
+			pthread_cond_destroy(&srv->work_cond);
+			pthread_mutex_destroy(&srv->task_lock);
+			cache_destroy(&srv->cache);
+			return -1;
+		}
+		srv->doh_fd6 = bind_tcp(AF_INET6, cfg->doh_listen_port);
+		if (srv->doh_fd6 < 0)
+			log_msg(LOG_WARN,
+			        "server: warning: IPv6 DoH bind port %d "
+			        "failed: %s\n",
+			        cfg->doh_listen_port, strerror(errno));
+	}
+
 	/* Spawn the worker thread pool */
 	for (int i = 0; i < MAX_CONCURRENT_QUERIES; i++) {
 		if (pthread_create(&srv->pool[i], NULL, worker_thread,
@@ -1481,6 +1577,11 @@ server_init(struct server *srv, const struct dns_config *cfg)
 	        srv->config.listen_port, listener_kind,
 	        srv->config.upstream_addr, srv->config.upstream_port,
 	        upstream_kind);
+	if (srv->config.listen_doh)
+		log_msg(LOG_INFO,
+		        "server: listening on 0.0.0.0:%d (DoH HTTP/1.1 "
+		        "/dns-query)\n",
+		        srv->config.doh_listen_port);
 	log_msg(LOG_WARN, "server: warning: no client ACL and only basic "
 	                  "per-source limits; not safe for public exposure\n");
 
@@ -1491,7 +1592,7 @@ int
 server_run(struct server *srv)
 {
 	while (srv->running) {
-		struct pollfd pfds[6];
+		struct pollfd pfds[8];
 		nfds_t        nfds = 0;
 
 		memset(pfds, 0, sizeof(pfds));
@@ -1525,6 +1626,16 @@ server_run(struct server *srv)
 			pfds[nfds].events = POLLIN;
 			nfds++;
 		}
+		if (srv->doh_fd >= 0) {
+			pfds[nfds].fd     = srv->doh_fd;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
+		if (srv->doh_fd6 >= 0) {
+			pfds[nfds].fd     = srv->doh_fd6;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
 
 		int ret = poll(pfds, nfds, 1000);
 		if (ret < 0) {
@@ -1540,8 +1651,11 @@ server_run(struct server *srv)
 		for (nfds_t i = 0; i < nfds; i++) {
 			if ((pfds[i].revents & POLLIN) == 0)
 				continue;
-			if (pfds[i].fd == srv->dot_fd
-			    || pfds[i].fd == srv->dot_fd6) {
+			if (pfds[i].fd == srv->doh_fd
+			    || pfds[i].fd == srv->doh_fd6) {
+				accept_and_dispatch_doh(srv, pfds[i].fd);
+			} else if (pfds[i].fd == srv->dot_fd
+			           || pfds[i].fd == srv->dot_fd6) {
 				accept_and_dispatch_dot(srv, pfds[i].fd);
 			} else if (pfds[i].fd == srv->tcp_fd
 			           || pfds[i].fd == srv->tcp_fd6) {
@@ -1592,6 +1706,14 @@ server_stop(struct server *srv)
 	if (srv->dot_fd6 >= 0) {
 		close(srv->dot_fd6);
 		srv->dot_fd6 = -1;
+	}
+	if (srv->doh_fd >= 0) {
+		close(srv->doh_fd);
+		srv->doh_fd = -1;
+	}
+	if (srv->doh_fd6 >= 0) {
+		close(srv->doh_fd6);
+		srv->doh_fd6 = -1;
 	}
 	if (srv->tls_ctx != NULL) {
 		SSL_CTX_free(srv->tls_ctx);

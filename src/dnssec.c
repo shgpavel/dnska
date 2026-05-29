@@ -30,6 +30,184 @@ dnssec_validation_state_str(enum dnssec_validation_state state)
 }
 
 int
+dnssec_canonical_name_from_text(const char *name, uint8_t *out,
+                                size_t out_size, size_t *out_len)
+{
+	if (name == NULL || out == NULL || out_len == NULL || out_size == 0)
+		return DNSSEC_ERR_MALFORMED;
+
+	if (name[0] == '\0' || (name[0] == '.' && name[1] == '\0')) {
+		out[0]   = 0;
+		*out_len = 1;
+		return DNSSEC_OK;
+	}
+
+	size_t      pos   = 0;
+	const char *label = name;
+	while (*label != '\0') {
+		const char *dot = strchr(label, '.');
+		size_t      len = dot != NULL ? (size_t)(dot - label) : strlen(label);
+
+		if (len == 0 || len > DNS_MAX_LABEL_LEN)
+			return DNSSEC_ERR_MALFORMED;
+		if (pos + 1 + len >= DNS_MAX_NAME_LEN)
+			return DNSSEC_ERR_MALFORMED;
+		if (pos + 1 + len + 1 > out_size)
+			return DNSSEC_ERR_NOBUFS;
+
+		out[pos++] = (uint8_t)len;
+		for (size_t i = 0; i < len; i++)
+			out[pos++] = (uint8_t)tolower((unsigned char)label[i]);
+
+		if (dot == NULL)
+			break;
+		label = dot + 1;
+		if (*label == '\0')
+			break;
+	}
+
+	if (pos + 1 > out_size)
+		return DNSSEC_ERR_NOBUFS;
+	out[pos++] = 0;
+	if (pos > DNS_MAX_NAME_LEN)
+		return DNSSEC_ERR_MALFORMED;
+
+	*out_len = pos;
+	return DNSSEC_OK;
+}
+
+int
+dnssec_canonical_name_from_wire(const uint8_t *msg, size_t msg_len,
+                                size_t offset, uint8_t *out,
+                                size_t out_size, size_t *out_len,
+                                size_t *bytes_consumed)
+{
+	size_t pos        = offset;
+	size_t out_pos    = 0;
+	size_t consumed   = 0;
+	bool   jumped     = false;
+	bool   terminated = false;
+	int    jumps      = 0;
+
+	if (msg == NULL || out == NULL || out_len == NULL || out_size == 0 || offset >= msg_len)
+		return DNSSEC_ERR_MALFORMED;
+
+	while (pos < msg_len) {
+		uint8_t len = msg[pos];
+
+		if (len == 0) {
+			if (!jumped)
+				consumed = pos - offset + 1;
+			if (out_pos + 1 > out_size)
+				return DNSSEC_ERR_NOBUFS;
+			out[out_pos++] = 0;
+			terminated     = true;
+			break;
+		}
+
+		if ((len & 0xC0) == 0xC0) {
+			if (pos + 1 >= msg_len || ++jumps > WIRE_NAME_MAX_HOPS)
+				return DNSSEC_ERR_MALFORMED;
+			if (!jumped)
+				consumed = pos - offset + 2;
+			uint16_t ptr = (uint16_t)(((uint16_t)(len & 0x3F) << 8)
+			                          | msg[pos + 1]);
+			if (ptr >= msg_len)
+				return DNSSEC_ERR_MALFORMED;
+			pos    = ptr;
+			jumped = true;
+			continue;
+		}
+
+		if ((len & 0xC0) != 0 || len > DNS_MAX_LABEL_LEN)
+			return DNSSEC_ERR_MALFORMED;
+
+		pos++;
+		if (pos + len > msg_len)
+			return DNSSEC_ERR_MALFORMED;
+		if (out_pos + 1 + len >= DNS_MAX_NAME_LEN)
+			return DNSSEC_ERR_MALFORMED;
+		if (out_pos + 1 + len + 1 > out_size)
+			return DNSSEC_ERR_NOBUFS;
+
+		out[out_pos++] = len;
+		for (uint8_t i = 0; i < len; i++)
+			out[out_pos++] = (uint8_t)tolower((unsigned char)msg[pos + i]);
+		pos += len;
+	}
+
+	if (!terminated)
+		return DNSSEC_ERR_MALFORMED;
+
+	*out_len = out_pos;
+	if (bytes_consumed != NULL)
+		*bytes_consumed = consumed;
+	return DNSSEC_OK;
+}
+
+bool
+dnssec_canonical_name_equal(const uint8_t *a, size_t a_len,
+                            const uint8_t *b, size_t b_len)
+{
+	if (a == NULL || b == NULL)
+		return false;
+	return a_len == b_len && memcmp(a, b, a_len) == 0;
+}
+
+int
+dnssec_parse_canonical_rr(const uint8_t *msg, size_t msg_len, size_t offset,
+                          struct dnssec_canonical_rr *out,
+                          size_t                     *rr_wire_len)
+{
+	size_t owner_consumed = 0;
+	size_t pos            = 0;
+	size_t rdata_pos      = 0;
+
+	if (msg == NULL || out == NULL)
+		return DNSSEC_ERR_MALFORMED;
+
+	memset(out, 0, sizeof(*out));
+
+	int rc = dnssec_canonical_name_from_wire(msg, msg_len, offset,
+	                                         out->owner,
+	                                         sizeof(out->owner),
+	                                         &out->owner_len,
+	                                         &owner_consumed);
+	if (rc != DNSSEC_OK)
+		return rc;
+
+	pos = offset + owner_consumed;
+	if (pos + 10 > msg_len)
+		return DNSSEC_ERR_MALFORMED;
+
+	out->type      = wire_read_u16(msg + pos);
+	out->rrclass   = wire_read_u16(msg + pos + 2);
+	out->ttl       = wire_read_u32(msg + pos + 4);
+	out->rdata_len = wire_read_u16(msg + pos + 8);
+	rdata_pos      = pos + 10;
+	if (out->rdata_len > msg_len - rdata_pos)
+		return DNSSEC_ERR_MALFORMED;
+
+	out->rdata = msg + rdata_pos;
+	if (rr_wire_len != NULL)
+		*rr_wire_len = rdata_pos + out->rdata_len - offset;
+
+	return DNSSEC_OK;
+}
+
+bool
+dnssec_canonical_rr_same_rrset(const struct dnssec_canonical_rr *a,
+                               const struct dnssec_canonical_rr *b)
+{
+	if (a == NULL || b == NULL)
+		return false;
+	return a->type == b->type
+	       && a->rrclass == b->rrclass
+	       && dnssec_canonical_name_equal(a->owner, a->owner_len,
+	                                      b->owner, b->owner_len);
+}
+
+int
 dnssec_parse_ds(const uint8_t *rdata, size_t rdlen, struct dnssec_ds *out)
 {
 	if (rdata == NULL || out == NULL || rdlen < 4)
@@ -64,9 +242,9 @@ dnssec_parse_dnskey(const uint8_t *rdata, size_t rdlen,
 	return DNSSEC_OK;
 }
 
-static bool
-type_bit_maps_well_formed(const uint8_t *type_bit_maps,
-                          size_t         type_bit_maps_len)
+bool
+dnssec_type_bitmap_is_well_formed(const uint8_t *type_bit_maps,
+                                  size_t         type_bit_maps_len)
 {
 	size_t pos         = 0;
 	int    last_window = -1;
@@ -144,8 +322,8 @@ dnssec_parse_nsec(const uint8_t *rdata, size_t rdlen,
 
 	out->type_bit_maps     = rdata + next_len;
 	out->type_bit_maps_len = rdlen - next_len;
-	if (!type_bit_maps_well_formed(out->type_bit_maps,
-	                               out->type_bit_maps_len))
+	if (!dnssec_type_bitmap_is_well_formed(out->type_bit_maps,
+	                                       out->type_bit_maps_len))
 		return DNSSEC_ERR_MALFORMED;
 
 	return DNSSEC_OK;
@@ -183,9 +361,48 @@ dnssec_parse_nsec3(const uint8_t *rdata, size_t rdlen,
 
 	out->type_bit_maps     = rdata + pos;
 	out->type_bit_maps_len = rdlen - pos;
-	if (!type_bit_maps_well_formed(out->type_bit_maps,
-	                               out->type_bit_maps_len))
+	if (!dnssec_type_bitmap_is_well_formed(out->type_bit_maps,
+	                                       out->type_bit_maps_len))
 		return DNSSEC_ERR_MALFORMED;
+
+	return DNSSEC_OK;
+}
+
+int
+dnssec_parse_tlsa(const uint8_t *rdata, size_t rdlen,
+                  struct dnssec_tlsa *out)
+{
+	if (rdata == NULL || out == NULL || rdlen < 4)
+		return DNSSEC_ERR_MALFORMED;
+
+	memset(out, 0, sizeof(*out));
+	out->certificate_usage    = rdata[0];
+	out->selector             = rdata[1];
+	out->matching_type        = rdata[2];
+	out->association_data     = rdata + 3;
+	out->association_data_len = rdlen - 3;
+
+	if (out->certificate_usage > DNSSEC_TLSA_USAGE_DANE_EE
+	    || out->selector > DNSSEC_TLSA_SELECTOR_SPKI
+	    || out->matching_type > DNSSEC_TLSA_MATCHING_SHA512)
+		return DNSSEC_ERR_UNSUPPORTED;
+
+	switch (out->matching_type) {
+	case DNSSEC_TLSA_MATCHING_FULL:
+		if (out->association_data_len == 0)
+			return DNSSEC_ERR_MALFORMED;
+		break;
+	case DNSSEC_TLSA_MATCHING_SHA256:
+		if (out->association_data_len != 32)
+			return DNSSEC_ERR_MALFORMED;
+		break;
+	case DNSSEC_TLSA_MATCHING_SHA512:
+		if (out->association_data_len != 64)
+			return DNSSEC_ERR_MALFORMED;
+		break;
+	default:
+		return DNSSEC_ERR_UNSUPPORTED;
+	}
 
 	return DNSSEC_OK;
 }
@@ -194,7 +411,8 @@ bool
 dnssec_type_bitmap_has_type(const uint8_t *type_bit_maps,
                             size_t type_bit_maps_len, uint16_t type)
 {
-	if (!type_bit_maps_well_formed(type_bit_maps, type_bit_maps_len))
+	if (!dnssec_type_bitmap_is_well_formed(type_bit_maps,
+	                                       type_bit_maps_len))
 		return false;
 
 	uint8_t want_window = (uint8_t)(type >> 8);
@@ -235,58 +453,14 @@ dnssec_dnskey_key_tag(const uint8_t *dnskey_rdata, size_t dnskey_rdata_len)
 	return (uint16_t)(acc & 0xFFFFu);
 }
 
-static int
-canonical_owner_wire(const char *owner_name, uint8_t *out, size_t out_size,
-                     size_t *out_len)
-{
-	if (owner_name == NULL || out == NULL || out_len == NULL || out_size == 0)
-		return DNSSEC_ERR_MALFORMED;
-
-	if (owner_name[0] == '\0'
-	    || (owner_name[0] == '.' && owner_name[1] == '\0')) {
-		out[0]   = 0;
-		*out_len = 1;
-		return DNSSEC_OK;
-	}
-
-	size_t      pos   = 0;
-	const char *label = owner_name;
-	while (*label != '\0') {
-		const char *dot = strchr(label, '.');
-		size_t      len = dot != NULL ? (size_t)(dot - label) : strlen(label);
-
-		if (len == 0 || len > DNS_MAX_LABEL_LEN)
-			return DNSSEC_ERR_MALFORMED;
-		if (pos + 1 + len + 1 > out_size)
-			return DNSSEC_ERR_NOBUFS;
-
-		out[pos++] = (uint8_t)len;
-		for (size_t i = 0; i < len; i++)
-			out[pos++] = (uint8_t)tolower((unsigned char)label[i]);
-
-		if (dot == NULL)
-			break;
-		label = dot + 1;
-		if (*label == '\0')
-			break;
-	}
-
-	if (pos + 1 > out_size)
-		return DNSSEC_ERR_NOBUFS;
-	out[pos++] = 0;
-	if (pos > DNS_MAX_NAME_LEN)
-		return DNSSEC_ERR_MALFORMED;
-
-	*out_len = pos;
-	return DNSSEC_OK;
-}
-
 static const EVP_MD *
 ds_digest_md(uint8_t digest_type)
 {
 	switch (digest_type) {
 	case DNSSEC_DS_DIGEST_SHA256:
 		return EVP_sha256();
+	case DNSSEC_DS_DIGEST_SHA384:
+		return EVP_sha384();
 	default:
 		return NULL;
 	}
@@ -306,8 +480,9 @@ dnssec_dnskey_ds_digest(const char    *owner_name,
 	if (dnskey_rdata == NULL || dnskey_rdata_len < 4 || digest == NULL || digest_len == NULL)
 		return DNSSEC_ERR_MALFORMED;
 
-	int rc = canonical_owner_wire(owner_name, owner_wire,
-	                              sizeof(owner_wire), &owner_wire_len);
+	int rc = dnssec_canonical_name_from_text(owner_name, owner_wire,
+	                                         sizeof(owner_wire),
+	                                         &owner_wire_len);
 	if (rc != DNSSEC_OK)
 		return rc;
 
@@ -374,6 +549,41 @@ dnssec_ds_matches_dnskey(const char                 *owner_name,
 
 	*matches = digest_len == ds->digest_len
 	           && memcmp(digest, ds->digest, digest_len) == 0;
+	return DNSSEC_OK;
+}
+
+int
+dnssec_dane_tlsa_precheck(enum dnssec_validation_state  dnssec_state,
+                          bool                          has_tlsa_rrset,
+                          enum dnssec_validation_state *dane_state)
+{
+	if (dane_state == NULL)
+		return DNSSEC_ERR_MALFORMED;
+
+	if (!has_tlsa_rrset) {
+		*dane_state = DNSSEC_VALIDATION_INDETERMINATE;
+		return DNSSEC_OK;
+	}
+
+	switch (dnssec_state) {
+	case DNSSEC_VALIDATION_SECURE:
+		*dane_state = DNSSEC_VALIDATION_SECURE;
+		break;
+	case DNSSEC_VALIDATION_BOGUS:
+		*dane_state = DNSSEC_VALIDATION_BOGUS;
+		break;
+	case DNSSEC_VALIDATION_INDETERMINATE:
+		*dane_state = DNSSEC_VALIDATION_INDETERMINATE;
+		break;
+	case DNSSEC_VALIDATION_INSECURE:
+	case DNSSEC_VALIDATION_UNCHECKED:
+		*dane_state = DNSSEC_VALIDATION_INSECURE;
+		break;
+	default:
+		*dane_state = DNSSEC_VALIDATION_INDETERMINATE;
+		break;
+	}
+
 	return DNSSEC_OK;
 }
 

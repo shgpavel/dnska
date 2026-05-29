@@ -6,7 +6,7 @@ parsing, and a built-in `dig`-style client.
 
 ## Features
 
-- UDP, TCP, and DoT listeners on IPv4 and IPv6
+- UDP, TCP, DoT, and HTTP/1.1 DoH listeners on IPv4 and IPv6
 - Plain UDP (with TCP fallback on TC=1), DoT (RFC 7858), or DoH (RFC 8484)
   upstream
 - Upstream certificate verification by default; system trust paths or
@@ -48,6 +48,8 @@ sudo ./build/dnska -u dns.google --upstream-doh --listen-mode dot
                                                 # DoT listener, DoH upstream
 sudo ./build/dnska -u dns.google --upstream-doh --edns-padding
                                                 # DoH upstream with EDNS padding
+sudo ./build/dnska -u 8.8.8.8 --listen-doh --doh-listen-port 8053
+                                                # add HTTP/1.1 POST /dns-query
 sudo ./build/dnska -u dns.google --resolver-discovery
                                                 # query _dns.dns.google SVCB
 sudo ./build/dnska -u 1.1.1.1 --upstream-doh \
@@ -80,6 +82,8 @@ Section: `[dns]`.  `#` and `;` comments are accepted.  See
 | `-c FILE` | Config file (default `dnska.conf`) |
 | `-p PORT` | Listen port (default 53; 853 for DoT listener) |
 | `--listen-mode M` | Listener mode: `auto`, `plain`, or `dot` |
+| `--listen-doh` | Enable HTTP/1.1 DoH listener on `/dns-query` |
+| `--doh-listen-port N` | DoH listener port (default `8053` when enabled) |
 | `-u ADDR` | Upstream IP or hostname (default `8.8.8.8`); hostname implies DoT, port 853 |
 | `--upstream-port N` | Override upstream port |
 | `-t` | Force DoT upstream when using an IP-literal upstream |
@@ -103,6 +107,8 @@ Section: `[dns]`.  `#` and `;` comments are accepted.  See
 `--listen-mode auto` preserves legacy behavior: a DoT upstream selected by
 hostname or `-t` also creates a DoT listener; DoH and plain upstreams create a
 plain UDP+TCP listener.  `plain` and `dot` override only the listener side.
+`--listen-doh` is independent and adds an HTTP/1.1 `POST /dns-query` listener
+without changing the plain or DoT listener choice.
 
 ## Limitations
 
@@ -110,9 +116,12 @@ plain UDP+TCP listener.  `plain` and `dot` override only the listener side.
   DS/DNSKEY/RRSIG/NSEC/NSEC3 parsing exists, and the server clears `AD` unless
   a future local validator marks the response secure.
 - No DoQ or ODoH transport yet; see `docs/modern-dns-roadmap.md`.
-- No DoH server listener (only DoH client/upstream).
+- DoH server listener accepts HTTP/1.1 `POST /dns-query` only; `GET` and other
+  methods are rejected.  It is cleartext HTTP, so terminate TLS in front for
+  HTTPS/RFC 8484 deployments.
 - HTTP/1.1 only for DoH (no HTTP/2).
-- No upstream connection pooling (one TLS connection per query).
+- DoH upstream connections are not pooled yet (HTTP/1.1 close per query);
+  DoT uses a small bounded per-upstream TLS reuse pool.
 - Forwarder, not a recursive resolver.
 - `--insecure` accepts any upstream certificate; do not use outside
   testing.

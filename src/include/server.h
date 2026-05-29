@@ -25,6 +25,13 @@ enum {
 
 struct server;
 
+enum query_transport {
+	QUERY_TRANSPORT_UDP = 0,
+	QUERY_TRANSPORT_TCP,
+	QUERY_TRANSPORT_DOT,
+	QUERY_TRANSPORT_DOH,
+};
+
 struct source_limit_entry {
 	struct in6_addr addr6;
 	unsigned int    inflight;
@@ -35,10 +42,11 @@ struct query_task {
 	struct server          *srv;
 	int                     slot;
 	int                     source_slot;
-	int                     sock_fd;   /* UDP: server bound socket, or -1 */
-	int                     conn_fd;   /* TCP/DoT: accepted conn, or -1 */
-	SSL_CTX                *tls_ctx;   /* non-NULL if incoming DoT conn */
-	SSL                    *tls;       /* allocated in handle_query() */
+	int                     sock_fd; /* UDP: server bound socket, or -1 */
+	int                     conn_fd; /* TCP/DoT: accepted conn, or -1 */
+	SSL_CTX                *tls_ctx; /* non-NULL if incoming DoT conn */
+	SSL                    *tls;     /* allocated in handle_query() */
+	enum query_transport    transport;
 	uint8_t                 query[DNS_MAX_MSG_SIZE];
 	size_t                  query_len; /* 0 for TCP/DoT tasks pending read */
 	struct sockaddr_storage client_addr;
@@ -53,6 +61,8 @@ struct server {
 	int                       tcp_fd6;
 	int                       dot_fd;  /* DoT IPv4 listen socket, or -1 */
 	int                       dot_fd6; /* DoT IPv6 listen socket, or -1 */
+	int                       doh_fd;  /* DoH IPv4 listen socket, or -1 */
+	int                       doh_fd6; /* DoH IPv6 listen socket, or -1 */
 	SSL_CTX                  *tls_ctx; /* server TLS context for DoT */
 	volatile sig_atomic_t     running;
 	pthread_t                 pool[MAX_CONCURRENT_QUERIES];

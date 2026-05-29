@@ -5,6 +5,10 @@ current forwarder shape.  It is intentionally a roadmap, not a hidden feature
 switch: dnska currently builds from a single `Makefile` and links only
 `-pthread -lssl -lcrypto`.
 
+Detailed transport design lives in `docs/doq-odoh-design.md`.  The standalone
+compile-only local probe for OpenSSL QUIC, HPKE, HKDF, and AEAD APIs is
+`test/transport_probe/openssl_quic_hpke_probe.c`.
+
 ## Current Transport Shape
 
 - `src/resolver.c` owns outbound forwarding.  `forward_one_address()` chooses
@@ -17,16 +21,36 @@ switch: dnska currently builds from a single `Makefile` and links only
 - `src/dns.c`, `src/print.c`, and their tests handle DNS wire parsing and
   dig-style output for single DNS responses, including modern SVCB/HTTPS,
   TLSA, ZONEMD, DNSSEC/NSEC3, and EDNS option presentation.
-- `src/dnssec.c` currently provides DNSSEC metadata parsing, DS/DNSKEY digest
-  checks, and non-claiming response state analysis.  It is not a full chain
-  validator yet.
+- `src/dnssec.c` currently provides DNSSEC metadata parsing, canonical
+  name/RR helper views, DNSKEY key tags, DS/DNSKEY SHA-256 and SHA-384 digest
+  checks, TLSA parsing plus DANE DNSSEC-state prechecks, and non-claiming
+  response state analysis.  It is not a full chain validator yet.
+
+## DNSSEC and DANE
+
+Current scope is deliberately below full validation.  DNSSEC helpers can parse
+DS, DNSKEY, RRSIG, NSEC, NSEC3, and TLSA RDATA; compute DNSKEY key tags; build
+canonical, uncompressed lowercase owner-name views from text or DNS wire names;
+and expose RR owner/type/class views for future RRset assembly.  RDATA
+canonicalization for signature input is still not implemented.
+
+DANE support is likewise a precondition layer, not TLS transport policy.  A
+TLSA RRset is usable for DANE only when the caller supplies
+`DNSSEC_VALIDATION_SECURE`; insecure or unchecked DNSSEC state maps to insecure,
+indeterminate state stays indeterminate, and bogus state stays bogus.  The
+resolver/TLS code still needs a later integration step that obtains a validated
+TLSA RRset for `_port._tcp.name`, binds it to the peer certificate according to
+TLSA usage/selector/matching rules, and defines fallback behavior.
 
 ## DNS over QUIC
 
 Decision: DoQ can be added without a new QUIC dependency only if the project is
 willing to make OpenSSL with QUIC support a required baseline.  This workspace
-has OpenSSL 3.6.2 and exposes `<openssl/quic.h>`, so an OpenSSL-only prototype
-is feasible here.  The repo does not currently detect OpenSSL versions or
+has OpenSSL 3.6.2 and exposes `<openssl/quic.h>`.  The compile-only probe in
+`test/transport_probe/openssl_quic_hpke_probe.c` confirms that the local
+headers expose `OSSL_QUIC_client_thread_method`, ALPN setup, initial peer
+address setup, bidirectional stream creation, FIN-capable writes, and stream
+read/conclude APIs.  The repo does not currently detect OpenSSL versions or
 feature-test QUIC APIs, so portable DoQ support needs an explicit dependency
 gate before implementation.
 
@@ -43,14 +67,15 @@ Implementation phases:
    - Document the selected minimum dependency in `README.md`.
 2. Config and CLI:
    - Replace the `upstream_tls`/`upstream_doh` boolean pair in
-     `src/include/config.h` with an upstream transport enum, or add
-     `upstream_doq` only as a short-lived compatibility field.
-   - Add `--upstream-doq` and `upstream_doq = true` in `src/main.c` and
-     `src/config.c`.
+     `src/include/config.h` with an upstream transport enum.  Keep the old
+     booleans as compatibility inputs while migrating call sites.
+   - Add `--upstream-transport doq` and `upstream_transport = doq` in
+     `src/main.c` and `src/config.c`.  A short-lived `--upstream-doq` alias is
+     acceptable if tests reject conflicts with other transport selectors.
    - Default DoQ to UDP port 853 unless `--upstream-port` is set.
 3. Resolver:
    - Add `forward_doq()` in `src/resolver.c` beside `forward_tls()` and
-     `forward_doh()`.
+     `forward_doh()`, behind the QUIC feature gate.
    - Use ALPN `doq`, the existing TLS verification names, a client-initiated
      bidirectional QUIC stream per DNS query, the same two-octet DNS length
      prefix used by TCP/DoT, and a DNS message ID of zero on the upstream copy.
@@ -67,10 +92,10 @@ Implementation phases:
 
 Decision: ODoH is not a small extension of the current DoH branch.  It needs an
 HPKE-backed envelope format plus a two-hop HTTP deployment model.  This
-workspace's OpenSSL exposes `<openssl/hpke.h>`, so the HPKE primitive can come
-from the existing crypto dependency if the project requires a sufficiently new
-OpenSSL.  The ODoH/OHTTP message encoding, key configuration parsing, URI
-template handling, and relay/target semantics still need new code.
+workspace's OpenSSL exposes `<openssl/hpke.h>`, and the compile-only probe
+confirms local access to HPKE setup/seal/export, HKDF, and AEAD APIs.  The
+ODoH/OHTTP message encoding, key configuration parsing, URI template handling,
+and relay/target semantics still need new code.
 
 Implementation phases:
 
@@ -100,6 +125,9 @@ Implementation phases:
      before adding network tests.
    - Add resolver tests for HTTP status, media type, content length, decrypt
      failure, and successful DNS response extraction.
+   - Keep RFC 9230 ODoH and RFC 9458 OHTTP tests separate: OHTTP also needs a
+     Binary HTTP codec and the `application/ohttp-keys`, `message/ohttp-req`,
+     and `message/ohttp-res` media types.
 
 ## XFR over TLS
 

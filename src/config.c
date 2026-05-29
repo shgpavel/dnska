@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "doh_server.h"
 
 static char *
 trim(char *s)
@@ -131,6 +132,8 @@ config_apply_transport_defaults(struct dns_config *cfg, bool upstream_is_hostnam
 		enum dns_listen_mode mode = config_effective_listen_mode(cfg);
 		cfg->listen_port          = mode == DNS_LISTEN_DOT ? 853 : 53;
 	}
+	if (cfg->listen_doh && !cfg->doh_listen_port_explicit)
+		cfg->doh_listen_port = DOH_SERVER_DEFAULT_PORT;
 }
 
 int
@@ -227,6 +230,22 @@ config_load(const char *path, struct dns_config *cfg)
 				fclose(f);
 				return -1;
 			}
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "listen_doh") == 0) {
+			cfg->listen_doh = parse_bool(val);
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "doh_listen_port") == 0) {
+			uint16_t port;
+
+			if (config_parse_port_u16(val, &port) < 0) {
+				fprintf(stderr,
+				        "config: invalid DoH listen port: %s\n",
+				        val);
+				fclose(f);
+				return -1;
+			}
+			cfg->doh_listen_port          = (int)port;
+			cfg->doh_listen_port_explicit = true;
 		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "upstream_tls") == 0) {
 			cfg->upstream_tls = parse_bool(val);

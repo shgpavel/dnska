@@ -25,6 +25,9 @@ struct dns_config {
 	int                  listen_port;
 	enum dns_listen_mode listen_mode;
 	bool                 listen_port_explicit;
+	bool                 listen_doh;
+	int                  doh_listen_port;
+	bool                 doh_listen_port_explicit;
 	char                 upstream_addr[256]; /* primary upstream IP for logs */
 	char                 upstream_addrs[DNS_UPSTREAM_MAX_ADDRS][INET6_ADDRSTRLEN];
 	size_t               upstream_addr_count;
