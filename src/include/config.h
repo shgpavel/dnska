@@ -21,31 +21,41 @@ enum dns_listen_mode {
 	DNS_LISTEN_DOT,
 };
 
+enum dns_upstream_transport {
+	DNS_UPSTREAM_TRANSPORT_PLAIN = 0, /* UDP with TCP fallback */
+	DNS_UPSTREAM_TRANSPORT_DOT,       /* DNS-over-TLS (RFC 7858) */
+	DNS_UPSTREAM_TRANSPORT_DOH,       /* DNS-over-HTTPS (RFC 8484) */
+};
+
 struct dns_config {
-	int                  listen_port;
-	enum dns_listen_mode listen_mode;
-	bool                 listen_port_explicit;
-	bool                 listen_doh;
-	int                  doh_listen_port;
-	bool                 doh_listen_port_explicit;
-	char                 upstream_addr[256]; /* primary upstream IP for logs */
-	char                 upstream_addrs[DNS_UPSTREAM_MAX_ADDRS][INET6_ADDRSTRLEN];
-	size_t               upstream_addr_count;
-	char                 upstream_hostname[256]; /* original hostname, empty if IP */
-	uint16_t             upstream_port;
-	bool                 upstream_port_explicit;
-	bool                 upstream_tls;       /* forward to upstream over DoT */
-	bool                 upstream_doh;       /* forward upstream over DoH (RFC 8484) */
-	char                 doh_path[128];      /* DoH URL path (default /dns-query) */
-	bool                 edns_padding;       /* pad encrypted upstream queries */
-	uint16_t             edns_padding_block; /* RFC 8467-style block size */
-	bool                 resolver_discovery; /* opt-in SVCB/DDR metadata query */
-	char                 resolver_discovery_name[256];
-	char                 tls_cert[256];      /* PEM cert for DoT listener */
-	char                 tls_key[256];       /* PEM key for DoT listener */
-	char                 tls_ca_file[256];   /* PEM CA bundle for upstream verify */
-	char                 tls_auth_name[256]; /* SNI/verify override for IP upstream */
-	bool                 tls_insecure;       /* skip upstream cert verification */
+	int                         listen_port;
+	enum dns_listen_mode        listen_mode;
+	bool                        listen_port_explicit;
+	bool                        listen_doh;
+	int                         doh_listen_port;
+	bool                        doh_listen_port_explicit;
+	char                        upstream_addr[256]; /* primary upstream IP for logs */
+	char                        upstream_addrs[DNS_UPSTREAM_MAX_ADDRS][INET6_ADDRSTRLEN];
+	size_t                      upstream_addr_count;
+	char                        upstream_hostname[256]; /* original hostname, empty if IP */
+	uint16_t                    upstream_port;
+	bool                        upstream_port_explicit;
+	enum dns_upstream_transport upstream_transport;
+	bool                        upstream_transport_explicit;
+	bool                        upstream_tls;       /* compatibility: DoT, true for DoH */
+	bool                        upstream_tls_explicit;
+	bool                        upstream_doh;       /* compatibility: DoH (RFC 8484) */
+	bool                        upstream_doh_explicit;
+	char                        doh_path[128];      /* DoH URL path (default /dns-query) */
+	bool                        edns_padding;       /* pad encrypted upstream queries */
+	uint16_t                    edns_padding_block; /* RFC 8467-style block size */
+	bool                        resolver_discovery; /* opt-in SVCB/DDR metadata query */
+	char                        resolver_discovery_name[256];
+	char                        tls_cert[256];      /* PEM cert for DoT listener */
+	char                        tls_key[256];       /* PEM key for DoT listener */
+	char                        tls_ca_file[256];   /* PEM CA bundle for upstream verify */
+	char                        tls_auth_name[256]; /* SNI/verify override for IP upstream */
+	bool                        tls_insecure;       /* skip upstream cert verification */
 };
 
 int
@@ -56,6 +66,14 @@ int
 config_parse_edns_padding_block(const char *value, uint16_t *out);
 int
 config_parse_listen_mode(const char *value, enum dns_listen_mode *out);
+int
+config_parse_upstream_transport(const char                  *value,
+                                enum dns_upstream_transport *out);
+const char *
+config_upstream_transport_name(enum dns_upstream_transport transport);
+int
+config_validate_transport_selectors(const struct dns_config *cfg,
+                                    const char              *source);
 enum dns_listen_mode
 config_effective_listen_mode(const struct dns_config *cfg);
 void

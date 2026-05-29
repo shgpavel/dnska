@@ -31,6 +31,7 @@ static struct option          long_options[] = {
 	{ "doh-listen-port",         required_argument, NULL, 'O' }, /* long only */
 	{ "upstream",                required_argument, NULL, 'u' },
 	{ "upstream-port",           required_argument, NULL, 'P' }, /* long only */
+	{ "upstream-transport",      required_argument, NULL, 'U' }, /* long only */
 	{ "upstream-tls",            no_argument,       NULL, 't' },
 	{ "tls-cert",                required_argument, NULL, 'C' }, /* long only */
 	{ "tls-key",                 required_argument, NULL, 'k' },
@@ -73,6 +74,9 @@ usage(const char *prog)
 	                "hostname implies DoT (port 853)\n");
 	fprintf(stderr, "      --upstream-port N  "
 	                "Upstream port (default: 53)\n");
+	fprintf(stderr, "      --upstream-transport T\n"
+	                "                         "
+	                "Upstream transport: plain, dot, or doh\n");
 	fprintf(stderr, "  -t, --upstream-tls     "
 	                "Force DoT upstream when using an IP address\n");
 	fprintf(stderr, "      --tls-cert FILE    "
@@ -246,8 +250,10 @@ apply_discovery_result(struct dns_config *cfg, const char *discovery_name,
 		         "%s", discovery_name);
 	}
 
-	if (cfg->upstream_doh && result->supports_doh) {
+	if (cfg->upstream_transport == DNS_UPSTREAM_TRANSPORT_DOH
+	    && result->supports_doh) {
 		cfg->upstream_tls = true;
+		cfg->upstream_doh = true;
 		if (result->doh_path[0] != '\0')
 			snprintf(cfg->doh_path, sizeof(cfg->doh_path), "%s",
 			         result->doh_path);
@@ -258,8 +264,12 @@ apply_discovery_result(struct dns_config *cfg, const char *discovery_name,
 		return;
 	}
 
-	if (!cfg->upstream_doh && result->supports_dot) {
-		cfg->upstream_tls = true;
+	if (result->supports_dot
+	    && (cfg->upstream_transport == DNS_UPSTREAM_TRANSPORT_DOT
+	        || !cfg->upstream_transport_explicit)) {
+		cfg->upstream_transport = DNS_UPSTREAM_TRANSPORT_DOT;
+		cfg->upstream_tls       = true;
+		cfg->upstream_doh       = false;
 		if (!cfg->upstream_port_explicit)
 			cfg->upstream_port = result->port != 0 ?
 			                             result->port :
@@ -284,9 +294,9 @@ discover_resolver_metadata(struct dns_config *cfg)
 	}
 
 	struct resolver_discovery_result result;
-	int                              rc = resolver_discover_svcb(
+	int                              rc = resolver_discover_svcb_transport(
 	        cfg->upstream_addrs, cfg->upstream_addr_count,
-	        cfg->upstream_port, cfg->upstream_tls, cfg->upstream_doh,
+	        cfg->upstream_port, cfg->upstream_transport,
 	        cfg->doh_path, cfg->upstream_hostname,
 	        configured_edns_padding_block(cfg), name, &result);
 	if (rc < 0) {
@@ -340,16 +350,12 @@ run_client_mode(struct dns_config *cfg, const char *qname, uint16_t qtype,
 	                        cfg->tls_insecure);
 
 	size_t response_len = 0;
-	int    rc           = resolver_forward(cfg->upstream_addrs,
-	                                       cfg->upstream_addr_count,
-	                                       cfg->upstream_port,
-	                                       cfg->upstream_tls,
-	                                       cfg->upstream_doh, cfg->doh_path,
-	                                       cfg->upstream_hostname,
-	                                       configured_edns_padding_block(cfg),
-	                                       query,
-	                                       query_len, response,
-	                                       sizeof(response), &response_len);
+	int    rc           = resolver_forward_transport(
+	        cfg->upstream_addrs, cfg->upstream_addr_count,
+	        cfg->upstream_port, cfg->upstream_transport,
+	        cfg->doh_path, cfg->upstream_hostname,
+	        configured_edns_padding_block(cfg), query, query_len,
+	        response, sizeof(response), &response_len);
 	if (rc < 0) {
 		fprintf(stderr, "error: upstream forward failed\n");
 		return 1;
@@ -454,8 +460,20 @@ main(int argc, char **argv)
 			cfg.upstream_port_explicit = true;
 			break;
 		}
+		case 'U':
+			if (config_parse_upstream_transport(
+			            optarg, &cfg.upstream_transport)
+			    < 0) {
+				fprintf(stderr,
+				        "error: invalid upstream transport: %s\n",
+				        optarg);
+				return 1;
+			}
+			cfg.upstream_transport_explicit = true;
+			break;
 		case 't':
-			cfg.upstream_tls = true;
+			cfg.upstream_tls          = true;
+			cfg.upstream_tls_explicit = true;
 			break;
 		case 'C':
 			snprintf(cfg.tls_cert, sizeof(cfg.tls_cert),
@@ -477,7 +495,8 @@ main(int argc, char **argv)
 			cfg.tls_insecure = true;
 			break;
 		case 'D':
-			cfg.upstream_doh = true;
+			cfg.upstream_doh          = true;
+			cfg.upstream_doh_explicit = true;
 			break;
 		case 'X':
 			snprintf(cfg.doh_path, sizeof(cfg.doh_path), "%s",
@@ -536,6 +555,9 @@ main(int argc, char **argv)
 			return 1;
 		}
 	}
+
+	if (config_validate_transport_selectors(&cfg, "error") < 0)
+		return 1;
 
 	struct in_addr  tmp4;
 	struct in6_addr tmp6;
@@ -614,7 +636,7 @@ main(int argc, char **argv)
 	 * DoH implies TLS upstream and requires a hostname (Host header).
 	 * For an IP-literal upstream the operator must supply --tls-auth-name.
 	 */
-	if (cfg.upstream_doh) {
+	if (cfg.upstream_transport == DNS_UPSTREAM_TRANSPORT_DOH) {
 		if (cfg.upstream_hostname[0] == '\0'
 		    && cfg.tls_auth_name[0] == '\0') {
 			fprintf(stderr,

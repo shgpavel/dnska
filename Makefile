@@ -14,7 +14,7 @@ BINDIR     ?= $(PREFIX)/bin
 SYSCONFDIR ?= /etc
 DOCDIR     ?= $(PREFIX)/share/doc/dnska
 
-SRCS    = $(SRCDIR)/main.c $(SRCDIR)/cache.c $(SRCDIR)/config.c $(SRCDIR)/dns.c $(SRCDIR)/dnssec.c $(SRCDIR)/doh_server.c $(SRCDIR)/log.c $(SRCDIR)/print.c $(SRCDIR)/random.c $(SRCDIR)/server.c $(SRCDIR)/resolver.c $(SRCDIR)/wire.c
+SRCS    = $(SRCDIR)/main.c $(SRCDIR)/cache.c $(SRCDIR)/config.c $(SRCDIR)/dns.c $(SRCDIR)/dnssec.c $(SRCDIR)/doh_server.c $(SRCDIR)/log.c $(SRCDIR)/odoh.c $(SRCDIR)/print.c $(SRCDIR)/random.c $(SRCDIR)/server.c $(SRCDIR)/resolver.c $(SRCDIR)/wire.c
 OBJS    = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
 HDRS    = $(wildcard $(SRCDIR)/include/*.h)
 TEST_SRCS = $(wildcard $(TESTDIR)/*/*_test.c)
@@ -28,10 +28,10 @@ PERF_TARGETS = $(addprefix $(TESTOBJDIR)/,$(PERF_NAMES))
 all: $(TARGET)
 
 check: $(TEST_TARGETS)
-	set -e; for t in $(TEST_TARGETS); do ./$$t; done
+	set -e; for t in $(TEST_TARGETS); do "$$t"; done
 
 perf: $(PERF_TARGETS)
-	set -e; for t in $(PERF_TARGETS); do ./$$t; done
+	set -e; for t in $(PERF_TARGETS); do "$$t"; done
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(dir $@)
@@ -60,6 +60,10 @@ $(TESTOBJDIR)/dnssec_test: $(TESTDIR)/dnssec/dnssec_test.c $(SRCDIR)/dnssec.c $(
 $(TESTOBJDIR)/doh_server_test: $(TESTDIR)/doh_server/doh_server_test.c $(SRCDIR)/doh_server.c $(HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/doh_server/doh_server_test.c $(SRCDIR)/doh_server.c
+
+$(TESTOBJDIR)/odoh_test: $(TESTDIR)/odoh/odoh_test.c $(SRCDIR)/odoh.c $(SRCDIR)/wire.c $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/odoh/odoh_test.c $(SRCDIR)/odoh.c $(SRCDIR)/wire.c
 
 $(TESTOBJDIR)/print_test: $(TESTDIR)/print/print_test.c $(SRCDIR)/print.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c $(HDRS)
 	@mkdir -p $(dir $@)

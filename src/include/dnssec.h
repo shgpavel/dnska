@@ -14,12 +14,14 @@
  *
  * 1. Current slice: parse DNSSEC metadata, expose canonical owner/RR
  *    helper views, compute DNSKEY key tags, verify DS SHA-256/SHA-384
- *    digests against DNSKEY RDATA, parse TLSA, and expose a
- *    response-analysis state plus DANE DNSSEC-state prechecks.  This does
- *    not validate RRset signatures or prove denial of existence.
+ *    digests against DNSKEY RDATA, parse TLSA, verify bounded
+ *    caller-provided RRset/RRSIG/DNSKEY tuples for supported opaque-RDATA
+ *    RR types and algorithms, and expose a response-analysis state plus
+ *    DANE DNSSEC-state prechecks.  This does not walk a chain of trust,
+ *    validate denial of existence, or assert AD.
  * 2. Chain validation: build canonical RRsets from a response plus
- *    fetched DNSKEY/DS material, verify RRSIG inception/expiration and
- *    signature algorithms, then walk trust anchors from root to qname.
+ *    fetched DNSKEY/DS material, verify all necessary RRsets, then walk
+ *    trust anchors from root to qname.
  * 3. Insecure delegations: prove missing DS with signed parent-side
  *    NSEC/NSEC3 denial and return insecure only for validated opt-outs
  *    or unsigned islands beneath an authenticated denial.
@@ -77,7 +79,9 @@ enum dnssec_tlsa_matching_type {
 };
 
 enum {
-	DNSSEC_MAX_DS_DIGEST_LEN = 64,
+	DNSSEC_MAX_DS_DIGEST_LEN         = 64,
+	DNSSEC_MAX_RRSIG_RRSET_RRS       = 64,
+	DNSSEC_MAX_RRSIG_SIGNED_DATA_LEN = 65535,
 };
 
 struct dnssec_canonical_rr {
@@ -217,6 +221,14 @@ dnssec_ds_matches_dnskey(const char                 *owner_name,
                          const uint8_t              *dnskey_rdata,
                          size_t                      dnskey_rdata_len,
                          bool                       *matches);
+
+int
+dnssec_verify_rrsig(const struct dnssec_canonical_rr *rrset,
+                    size_t rr_count, const struct dnssec_rrsig *rrsig,
+                    const char                 *dnskey_owner_name,
+                    const struct dnssec_dnskey *dnskey,
+                    const uint8_t *dnskey_rdata, size_t dnskey_rdata_len,
+                    uint32_t validation_time, bool *verified);
 
 int
 dnssec_dane_tlsa_precheck(enum dnssec_validation_state  dnssec_state,

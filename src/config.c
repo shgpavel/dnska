@@ -94,13 +94,102 @@ config_parse_listen_mode(const char *value, enum dns_listen_mode *out)
 	return -1;
 }
 
+int
+config_parse_upstream_transport(const char                  *value,
+                                enum dns_upstream_transport *out)
+{
+	if (strcmp(value, "plain") == 0) {
+		*out = DNS_UPSTREAM_TRANSPORT_PLAIN;
+		return 0;
+	}
+	if (strcmp(value, "dot") == 0) {
+		*out = DNS_UPSTREAM_TRANSPORT_DOT;
+		return 0;
+	}
+	if (strcmp(value, "doh") == 0) {
+		*out = DNS_UPSTREAM_TRANSPORT_DOH;
+		return 0;
+	}
+
+	return -1;
+}
+
+const char *
+config_upstream_transport_name(enum dns_upstream_transport transport)
+{
+	switch (transport) {
+	case DNS_UPSTREAM_TRANSPORT_PLAIN:
+		return "plain";
+	case DNS_UPSTREAM_TRANSPORT_DOT:
+		return "dot";
+	case DNS_UPSTREAM_TRANSPORT_DOH:
+		return "doh";
+	}
+
+	return "unknown";
+}
+
+int
+config_validate_transport_selectors(const struct dns_config *cfg,
+                                    const char              *source)
+{
+	const char *prefix = source != NULL ? source : "config";
+
+	if (!cfg->upstream_transport_explicit)
+		return 0;
+
+	if (cfg->upstream_tls_explicit && cfg->upstream_tls && cfg->upstream_transport != DNS_UPSTREAM_TRANSPORT_DOT) {
+		fprintf(stderr,
+		        "%s: upstream_transport=%s conflicts with "
+		        "upstream_tls=true\n",
+		        prefix,
+		        config_upstream_transport_name(cfg->upstream_transport));
+		return -1;
+	}
+	if (cfg->upstream_doh_explicit && cfg->upstream_doh && cfg->upstream_transport != DNS_UPSTREAM_TRANSPORT_DOH) {
+		fprintf(stderr,
+		        "%s: upstream_transport=%s conflicts with "
+		        "upstream_doh=true\n",
+		        prefix,
+		        config_upstream_transport_name(cfg->upstream_transport));
+		return -1;
+	}
+
+	return 0;
+}
+
+static enum dns_upstream_transport
+config_requested_upstream_transport(const struct dns_config *cfg,
+                                    bool                     upstream_is_hostname)
+{
+	if (cfg->upstream_transport_explicit)
+		return cfg->upstream_transport;
+	if (cfg->upstream_doh)
+		return DNS_UPSTREAM_TRANSPORT_DOH;
+	if (cfg->upstream_tls)
+		return DNS_UPSTREAM_TRANSPORT_DOT;
+	if (upstream_is_hostname)
+		return DNS_UPSTREAM_TRANSPORT_DOT;
+
+	return DNS_UPSTREAM_TRANSPORT_PLAIN;
+}
+
+static void
+config_sync_legacy_transport_fields(struct dns_config *cfg)
+{
+	cfg->upstream_tls = cfg->upstream_transport == DNS_UPSTREAM_TRANSPORT_DOT
+	                    || cfg->upstream_transport == DNS_UPSTREAM_TRANSPORT_DOH;
+	cfg->upstream_doh = cfg->upstream_transport == DNS_UPSTREAM_TRANSPORT_DOH;
+}
+
 enum dns_listen_mode
 config_effective_listen_mode(const struct dns_config *cfg)
 {
 	if (cfg->listen_mode != DNS_LISTEN_AUTO)
 		return cfg->listen_mode;
 
-	if (cfg->upstream_tls && !cfg->upstream_doh)
+	enum dns_upstream_transport transport = config_requested_upstream_transport(cfg, false);
+	if (transport == DNS_UPSTREAM_TRANSPORT_DOT)
 		return DNS_LISTEN_DOT;
 
 	return DNS_LISTEN_PLAIN;
@@ -109,22 +198,22 @@ config_effective_listen_mode(const struct dns_config *cfg)
 void
 config_apply_transport_defaults(struct dns_config *cfg, bool upstream_is_hostname)
 {
-	if (upstream_is_hostname)
-		cfg->upstream_tls = true;
+	cfg->upstream_transport = config_requested_upstream_transport(cfg, upstream_is_hostname);
+	config_sync_legacy_transport_fields(cfg);
+
 	if (cfg->edns_padding && cfg->edns_padding_block == 0)
 		cfg->edns_padding_block = DNS_EDNS_PADDING_DEFAULT_BLOCK;
 
-	if (cfg->upstream_doh) {
-		cfg->upstream_tls = true;
+	if (cfg->upstream_transport == DNS_UPSTREAM_TRANSPORT_DOH) {
 		if (cfg->doh_path[0] == '\0')
 			snprintf(cfg->doh_path, sizeof(cfg->doh_path),
 			         "/dns-query");
 	}
 
 	if (!cfg->upstream_port_explicit) {
-		if (cfg->upstream_doh)
+		if (cfg->upstream_transport == DNS_UPSTREAM_TRANSPORT_DOH)
 			cfg->upstream_port = 443;
-		else if (cfg->upstream_tls)
+		else if (cfg->upstream_transport == DNS_UPSTREAM_TRANSPORT_DOT)
 			cfg->upstream_port = 853;
 	}
 
@@ -247,11 +336,25 @@ config_load(const char *path, struct dns_config *cfg)
 			cfg->doh_listen_port          = (int)port;
 			cfg->doh_listen_port_explicit = true;
 		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "upstream_transport") == 0) {
+			if (config_parse_upstream_transport(
+			            val, &cfg->upstream_transport)
+			    < 0) {
+				fprintf(stderr,
+				        "config: invalid upstream transport: %s\n",
+				        val);
+				fclose(f);
+				return -1;
+			}
+			cfg->upstream_transport_explicit = true;
+		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "upstream_tls") == 0) {
-			cfg->upstream_tls = parse_bool(val);
+			cfg->upstream_tls          = parse_bool(val);
+			cfg->upstream_tls_explicit = true;
 		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "upstream_doh") == 0) {
-			cfg->upstream_doh = parse_bool(val);
+			cfg->upstream_doh          = parse_bool(val);
+			cfg->upstream_doh_explicit = true;
 		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "doh_path") == 0) {
 			snprintf(cfg->doh_path, sizeof(cfg->doh_path), "%s", val);
@@ -303,5 +406,8 @@ config_load(const char *path, struct dns_config *cfg)
 	}
 
 	fclose(f);
+	if (config_validate_transport_selectors(cfg, "config") < 0)
+		return -1;
+
 	return 0;
 }

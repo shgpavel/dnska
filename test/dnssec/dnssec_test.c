@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <openssl/evp.h>
+
 #include "dns.h"
 #include "dnssec.h"
 #include "test.h"
@@ -118,6 +120,72 @@ make_rrsig_rdata(uint8_t *buf)
 	buf[pos++]  = 0xBE;
 	buf[pos++]  = 0xEF;
 	return pos;
+}
+
+static size_t
+make_ed25519_rrsig_rdata(uint8_t *buf, uint16_t key_tag,
+                         const uint8_t *signature, size_t signature_len)
+{
+	size_t pos = 0;
+
+	write_u16(buf + pos, DNS_TYPE_A);
+	buf[pos + 2] = DNSSEC_ALGORITHM_ED25519;
+	buf[pos + 3] = 2;
+	write_u32(buf + pos + 4, 300);
+	write_u32(buf + pos + 8, 1800000000);
+	write_u32(buf + pos + 12, 1700000000);
+	write_u16(buf + pos + 16, key_tag);
+	pos += 18;
+
+	pos  = append_name(buf, pos, "example.com");
+	memcpy(buf + pos, signature, signature_len);
+	return pos + signature_len;
+}
+
+static size_t
+make_ed25519_signed_a_data(uint8_t *buf, uint16_t key_tag,
+                           const uint8_t *a_rdata)
+{
+	size_t pos = 0;
+
+	write_u16(buf + pos, DNS_TYPE_A);
+	buf[pos + 2] = DNSSEC_ALGORITHM_ED25519;
+	buf[pos + 3] = 2;
+	write_u32(buf + pos + 4, 300);
+	write_u32(buf + pos + 8, 1800000000);
+	write_u32(buf + pos + 12, 1700000000);
+	write_u16(buf + pos + 16, key_tag);
+	pos += 18;
+
+	pos  = append_name(buf, pos, "example.com");
+	pos  = append_name(buf, pos, "example.com");
+	write_u16(buf + pos, DNS_TYPE_A);
+	write_u16(buf + pos + 2, DNS_CLASS_IN);
+	write_u32(buf + pos + 4, 300);
+	write_u16(buf + pos + 8, 4);
+	pos += 10;
+	memcpy(buf + pos, a_rdata, 4);
+	return pos + 4;
+}
+
+static bool
+sign_ed25519(const uint8_t *private_key, const uint8_t *data,
+             size_t data_len, uint8_t *signature, size_t *signature_len)
+{
+	EVP_PKEY   *pkey = EVP_PKEY_new_raw_private_key_ex(NULL, "ED25519",
+	                                                   NULL,
+	                                                   private_key, 32);
+	EVP_MD_CTX *ctx  = EVP_MD_CTX_new();
+	size_t      len  = 64;
+	bool        ok   = pkey != NULL && ctx != NULL && EVP_DigestSignInit(ctx, NULL, NULL, NULL, pkey) == 1 && EVP_DigestSign(ctx, signature, &len, data, data_len) == 1;
+
+	EVP_MD_CTX_free(ctx);
+	EVP_PKEY_free(pkey);
+	if (!ok)
+		return false;
+
+	*signature_len = len;
+	return true;
 }
 
 static void
@@ -325,6 +393,196 @@ test_ds_matches_dnskey_sha384(void)
 	                                &matches)
 	       == DNSSEC_OK);
 	assert(matches);
+}
+
+static void
+test_verify_rrsig_ed25519(void)
+{
+	static const uint8_t ed25519_private_key[32] = {
+		0x9D,
+		0x61,
+		0xB1,
+		0x9D,
+		0xEF,
+		0xFD,
+		0x5A,
+		0x60,
+		0xBA,
+		0x84,
+		0x4A,
+		0xF4,
+		0x92,
+		0xEC,
+		0x2C,
+		0xC4,
+		0x44,
+		0x49,
+		0xC5,
+		0x69,
+		0x7B,
+		0x32,
+		0x69,
+		0x19,
+		0x70,
+		0x3B,
+		0xAC,
+		0x03,
+		0x1C,
+		0xAE,
+		0x7F,
+		0x60,
+	};
+	static const uint8_t ed25519_public_key[32] = {
+		0xD7,
+		0x5A,
+		0x98,
+		0x01,
+		0x82,
+		0xB1,
+		0x0A,
+		0xB7,
+		0xD5,
+		0x4B,
+		0xFE,
+		0xD3,
+		0xC9,
+		0x64,
+		0x07,
+		0x3A,
+		0x0E,
+		0xE1,
+		0x72,
+		0xF3,
+		0xDA,
+		0xA6,
+		0x23,
+		0x25,
+		0xAF,
+		0x02,
+		0x1A,
+		0x68,
+		0xF7,
+		0x07,
+		0x51,
+		0x1A,
+	};
+	uint8_t dnskey_rdata[4 + 32] = { 0x01, 0x01, 0x03,
+		                         DNSSEC_ALGORITHM_ED25519 };
+	uint8_t signed_data[128];
+	uint8_t signature[64];
+	uint8_t rrsig_rdata[128];
+	uint8_t dns_msg[256];
+	uint8_t a_rdata[4] = { 192, 0, 2, 9 };
+	uint8_t mx_rdata[] = {
+		0x00,
+		0x0A,
+		0x04,
+		'm',
+		'a',
+		'i',
+		'l',
+		0x07,
+		'e',
+		'x',
+		'a',
+		'm',
+		'p',
+		'l',
+		'e',
+		0x03,
+		'c',
+		'o',
+		'm',
+		0x00,
+	};
+	struct dnssec_dnskey       dnskey;
+	struct dnssec_rrsig        rrsig;
+	struct dnssec_rrsig        unsupported_rrsig;
+	struct dnssec_canonical_rr rr;
+	struct dnssec_canonical_rr mx_rr;
+	size_t                     signed_len = 0;
+	size_t                     sig_len    = 0;
+	size_t                     rrsig_len  = 0;
+	size_t                     rr_len     = 0;
+	size_t                     pos        = 0;
+	bool                       verified   = false;
+
+	memcpy(dnskey_rdata + 4, ed25519_public_key, sizeof(ed25519_public_key));
+	assert(dnssec_parse_dnskey(dnskey_rdata, sizeof(dnskey_rdata),
+	                           &dnskey)
+	       == DNSSEC_OK);
+
+	signed_len = make_ed25519_signed_a_data(
+	        signed_data,
+	        dnssec_dnskey_key_tag(dnskey_rdata, sizeof(dnskey_rdata)),
+	        a_rdata);
+	assert(sign_ed25519(ed25519_private_key, signed_data, signed_len,
+	                    signature, &sig_len));
+	assert(sig_len == sizeof(signature));
+
+	rrsig_len = make_ed25519_rrsig_rdata(
+	        rrsig_rdata,
+	        dnssec_dnskey_key_tag(dnskey_rdata, sizeof(dnskey_rdata)),
+	        signature, sig_len);
+	assert(dnssec_parse_rrsig(rrsig_rdata, rrsig_len, &rrsig)
+	       == DNSSEC_OK);
+
+	pos = append_rr(dns_msg, 0, "Example.COM", DNS_TYPE_A, a_rdata,
+	                sizeof(a_rdata));
+	assert(dnssec_parse_canonical_rr(dns_msg, pos, 0, &rr, &rr_len)
+	       == DNSSEC_OK);
+	assert(rr_len == pos);
+
+	assert(dnssec_verify_rrsig(&rr, 1, &rrsig, "example.com", &dnskey,
+	                           dnskey_rdata, sizeof(dnskey_rdata),
+	                           1750000000, &verified)
+	       == DNSSEC_OK);
+	assert(verified);
+
+	rrsig_rdata[rrsig_len - 1] ^= 0x01;
+	assert(dnssec_parse_rrsig(rrsig_rdata, rrsig_len, &rrsig)
+	       == DNSSEC_OK);
+	assert(dnssec_verify_rrsig(&rr, 1, &rrsig, "example.com", &dnskey,
+	                           dnskey_rdata, sizeof(dnskey_rdata),
+	                           1750000000, &verified)
+	       == DNSSEC_OK);
+	assert(!verified);
+	rrsig_rdata[rrsig_len - 1] ^= 0x01;
+	assert(dnssec_parse_rrsig(rrsig_rdata, rrsig_len, &rrsig)
+	       == DNSSEC_OK);
+
+	assert(dnssec_verify_rrsig(&rr, 1, &rrsig, "other.example",
+	                           &dnskey, dnskey_rdata,
+	                           sizeof(dnskey_rdata), 1750000000,
+	                           &verified)
+	       == DNSSEC_OK);
+	assert(!verified);
+
+	assert(dnssec_verify_rrsig(&rr, 1, &rrsig, "example.com", &dnskey,
+	                           dnskey_rdata, sizeof(dnskey_rdata),
+	                           1699999999, &verified)
+	       == DNSSEC_OK);
+	assert(!verified);
+
+	unsupported_rrsig           = rrsig;
+	unsupported_rrsig.algorithm = 253;
+	assert(dnssec_verify_rrsig(&rr, 1, &unsupported_rrsig,
+	                           "example.com", &dnskey, dnskey_rdata,
+	                           sizeof(dnskey_rdata), 1750000000,
+	                           &verified)
+	       == DNSSEC_ERR_UNSUPPORTED);
+
+	pos = append_rr(dns_msg, 0, "example.com", DNS_TYPE_MX, mx_rdata,
+	                sizeof(mx_rdata));
+	assert(dnssec_parse_canonical_rr(dns_msg, pos, 0, &mx_rr, NULL)
+	       == DNSSEC_OK);
+	unsupported_rrsig              = rrsig;
+	unsupported_rrsig.type_covered = DNS_TYPE_MX;
+	assert(dnssec_verify_rrsig(&mx_rr, 1, &unsupported_rrsig,
+	                           "example.com", &dnskey, dnskey_rdata,
+	                           sizeof(dnskey_rdata), 1750000000,
+	                           &verified)
+	       == DNSSEC_ERR_UNSUPPORTED);
 }
 
 static void
@@ -541,6 +799,7 @@ main(void)
 	test_parse_ds_and_dnskey();
 	test_ds_matches_dnskey_sha256();
 	test_ds_matches_dnskey_sha384();
+	test_verify_rrsig_ed25519();
 	test_parse_rrsig_nsec_nsec3();
 	test_type_bitmap_multi_window();
 	test_parse_tlsa_and_dane_precheck();

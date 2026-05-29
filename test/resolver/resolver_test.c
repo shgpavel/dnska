@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -338,9 +339,11 @@ test_id_randomized_flags_stripped(void)
 
 	char addrs[1][INET6_ADDRSTRLEN];
 	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
-	rc = resolver_forward(addrs, 1, ntohs(upstream_addr.sin_port),
-	                      false, false, NULL, NULL, 0, query, query_len,
-	                      response, sizeof(response), &response_len);
+	rc = resolver_forward_transport(addrs, 1, ntohs(upstream_addr.sin_port),
+	                                DNS_UPSTREAM_TRANSPORT_PLAIN, NULL,
+	                                NULL, 0, query, query_len,
+	                                response, sizeof(response),
+	                                &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture.fd);
@@ -439,9 +442,10 @@ test_0x20_randomization_uppercase_present(void)
 
 	char addrs[1][INET6_ADDRSTRLEN];
 	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
-	resolver_forward(addrs, 1, ntohs(upstream_addr.sin_port), false, false,
-	                 NULL, NULL, 0, query, query_len, response,
-	                 sizeof(response), &response_len);
+	resolver_forward_transport(addrs, 1, ntohs(upstream_addr.sin_port),
+	                           DNS_UPSTREAM_TRANSPORT_PLAIN, NULL, NULL,
+	                           0, query, query_len, response,
+	                           sizeof(response), &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture.fd);
@@ -591,10 +595,12 @@ run_dot_padding_forward(struct dot_padding_fixture *fixture,
 
 	char addrs[1][INET6_ADDRSTRLEN];
 	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
-	rc = resolver_forward(addrs, 1, fixture->port, true, false,
-	                      NULL, "localhost", padding_block,
-	                      query, query_len,
-	                      response, response_size, response_len);
+	rc = resolver_forward_transport(addrs, 1, fixture->port,
+	                                DNS_UPSTREAM_TRANSPORT_DOT, NULL,
+	                                "localhost", padding_block,
+	                                query, query_len,
+	                                response, response_size,
+	                                response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture->fd);
@@ -770,16 +776,14 @@ test_dot_tls_connection_reused_and_padding_is_per_query(void)
 
 	char addrs[1][INET6_ADDRSTRLEN];
 	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
-	int rc1 = resolver_forward(addrs, 1, fixture.port, true, false,
-	                           NULL, "localhost", 128,
-	                           query1, query1_len,
-	                           response, sizeof(response),
-	                           &response_len);
-	int rc2 = resolver_forward(addrs, 1, fixture.port, true, false,
-	                           NULL, "localhost", 128,
-	                           query2, query2_len,
-	                           response, sizeof(response),
-	                           &response_len);
+	int rc1 = resolver_forward_transport(
+	        addrs, 1, fixture.port, DNS_UPSTREAM_TRANSPORT_DOT, NULL,
+	        "localhost", 128, query1, query1_len, response,
+	        sizeof(response), &response_len);
+	int rc2 = resolver_forward_transport(
+	        addrs, 1, fixture.port, DNS_UPSTREAM_TRANSPORT_DOT, NULL,
+	        "localhost", 128, query2, query2_len, response,
+	        sizeof(response), &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture.fd);
@@ -839,10 +843,11 @@ test_plain_udp_does_not_add_edns_padding(void)
 
 	char addrs[1][INET6_ADDRSTRLEN];
 	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
-	rc = resolver_forward(addrs, 1, ntohs(upstream_addr.sin_port),
-	                      false, false, NULL, NULL, 128,
-	                      query, query_len, response, sizeof(response),
-	                      &response_len);
+	rc = resolver_forward_transport(addrs, 1, ntohs(upstream_addr.sin_port),
+	                                DNS_UPSTREAM_TRANSPORT_PLAIN, NULL,
+	                                NULL, 128, query, query_len,
+	                                response, sizeof(response),
+	                                &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture.fd);
@@ -852,6 +857,261 @@ test_plain_udp_does_not_add_edns_padding(void)
 	TEST_CHECK(!find_padding_option(fixture.received_query,
 	                                (size_t)fixture.received_len,
 	                                &padding_len));
+}
+
+struct doh_fixture {
+	int         fd;
+	SSL_CTX    *ctx;
+	uint16_t    port;
+	bool        saw_custom_path;
+	bool        saw_host;
+	uint8_t     received_query[DNS_MAX_MSG_SIZE];
+	size_t      received_len;
+	const char *response_content_type;
+	const char *response_content_length;
+	bool        send_body;
+};
+
+static int
+ssl_read_http_headers(SSL *ssl, char *headers, size_t headers_size)
+{
+	size_t pos = 0;
+
+	while (pos + 1 < headers_size) {
+		int n = SSL_read(ssl, headers + pos, 1);
+		if (n <= 0)
+			return -1;
+		pos += (size_t)n;
+		if (pos >= 4 && memcmp(headers + pos - 4, "\r\n\r\n", 4) == 0) {
+			headers[pos] = '\0';
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static size_t
+http_content_length(const char *headers)
+{
+	const char *line = strstr(headers, "\r\nContent-Length: ");
+
+	if (line == NULL)
+		return 0;
+	line += strlen("\r\nContent-Length: ");
+
+	return (size_t)strtoul(line, NULL, 10);
+}
+
+static void *
+serve_doh_once(void *arg)
+{
+	struct doh_fixture *fixture = arg;
+	struct sockaddr_in  client_addr;
+	socklen_t           client_len = sizeof(client_addr);
+	int                 conn;
+	SSL                *ssl;
+	char                headers[2048];
+	char                response_headers[256];
+	uint8_t             response[DNS_MAX_MSG_SIZE];
+
+	conn = accept(fixture->fd, (struct sockaddr *)&client_addr,
+	              &client_len);
+	TEST_CHECK(conn >= 0);
+
+	ssl = SSL_new(fixture->ctx);
+	TEST_CHECK(ssl != NULL);
+	TEST_CHECK(SSL_set_fd(ssl, conn) == 1);
+	TEST_CHECK(SSL_accept(ssl) > 0);
+
+	TEST_CHECK(ssl_read_http_headers(ssl, headers, sizeof(headers)) == 0);
+	fixture->saw_custom_path = strncmp(headers, "POST /custom-dns HTTP/1.1\r\n", 27) == 0;
+	fixture->saw_host        = strstr(headers, "\r\nHost: localhost\r\n") != NULL;
+
+	fixture->received_len    = http_content_length(headers);
+	TEST_CHECK(fixture->received_len >= DNS_HEADER_SIZE);
+	TEST_CHECK(fixture->received_len <= sizeof(fixture->received_query));
+	TEST_CHECK(ssl_read_exact(ssl, fixture->received_query,
+	                          fixture->received_len)
+	           == 0);
+
+	memcpy(response, fixture->received_query, fixture->received_len);
+	write_u16(response + 2,
+	          DNS_FLAG_QR | DNS_FLAG_RA | (wire_read_u16(response + 2) & DNS_FLAG_RD));
+
+	const char *content_type = fixture->response_content_type != NULL ?
+	                                   fixture->response_content_type :
+	                                   "application/dns-message";
+	char        content_length[64];
+	if (fixture->response_content_length != NULL) {
+		snprintf(content_length, sizeof(content_length), "%s",
+		         fixture->response_content_length);
+	} else {
+		snprintf(content_length, sizeof(content_length), "%zu",
+		         fixture->received_len);
+	}
+
+	int hn = snprintf(response_headers, sizeof(response_headers),
+	                  "HTTP/1.1 200 OK\r\n"
+	                  "Content-Type: %s\r\n"
+	                  "Content-Length: %s\r\n"
+	                  "Connection: close\r\n\r\n",
+	                  content_type, content_length);
+	TEST_CHECK(hn > 0 && (size_t)hn < sizeof(response_headers));
+	TEST_CHECK(ssl_write_exact(ssl, (const uint8_t *)response_headers,
+	                           (size_t)hn)
+	           == 0);
+	if (fixture->send_body)
+		TEST_CHECK(ssl_write_exact(ssl, response, fixture->received_len) == 0);
+
+	SSL_shutdown(ssl);
+	SSL_free(ssl);
+	close(conn);
+	return NULL;
+}
+
+static void
+test_doh_transport_uses_https_path_and_padding(void)
+{
+	struct doh_fixture fixture;
+	struct sockaddr_in addr;
+	socklen_t          addr_len = sizeof(addr);
+	pthread_t          thread;
+	uint8_t            query[DNS_MAX_MSG_SIZE];
+	uint8_t            response[DNS_MAX_MSG_SIZE];
+	size_t             query_len;
+	size_t             response_len = 0;
+	uint16_t           padding_len  = 0;
+
+	memset(&fixture, 0, sizeof(fixture));
+	fixture.send_body = true;
+	fixture.fd        = socket(AF_INET, SOCK_STREAM, 0);
+	if (fixture.fd < 0 && (errno == EPERM || errno == EACCES))
+		TEST_SKIP("resolver tests skipped: TCP sockets unavailable");
+	TEST_CHECK(fixture.fd >= 0);
+
+	int optval = 1;
+	setsockopt(fixture.fd, SOL_SOCKET, SO_REUSEADDR,
+	           &optval, sizeof(optval));
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family      = AF_INET;
+	addr.sin_port        = 0;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	TEST_CHECK(bind(fixture.fd, (struct sockaddr *)&addr, sizeof(addr))
+	           == 0);
+	TEST_CHECK(getsockname(fixture.fd, (struct sockaddr *)&addr,
+	                       &addr_len)
+	           == 0);
+	TEST_CHECK(listen(fixture.fd, 1) == 0);
+	fixture.port = ntohs(addr.sin_port);
+
+	fixture.ctx  = SSL_CTX_new(TLS_server_method());
+	TEST_CHECK(fixture.ctx != NULL);
+	SSL_CTX_set_min_proto_version(fixture.ctx, TLS1_2_VERSION);
+	TEST_CHECK(make_selfsigned_cert(fixture.ctx) == 0);
+
+	TEST_CHECK(pthread_create(&thread, NULL, serve_doh_once,
+	                          &fixture)
+	           == 0);
+
+	resolver_set_tls_config(NULL, NULL, true);
+
+	query_len = make_query(query, 0xD0A0, DNS_FLAG_RD, "example.com");
+
+	char addrs[1][INET6_ADDRSTRLEN];
+	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
+	int rc = resolver_forward_transport(
+	        addrs, 1, fixture.port, DNS_UPSTREAM_TRANSPORT_DOH,
+	        "/custom-dns", "localhost", 128, query, query_len,
+	        response, sizeof(response), &response_len);
+
+	TEST_CHECK(pthread_join(thread, NULL) == 0);
+	close(fixture.fd);
+	SSL_CTX_free(fixture.ctx);
+
+	TEST_EXPECT_INT_EQ(rc, 0);
+	TEST_CHECK(fixture.saw_custom_path);
+	TEST_CHECK(fixture.saw_host);
+	TEST_CHECK(fixture.received_len > query_len);
+	TEST_EXPECT_SIZE_EQ(fixture.received_len % 128, 0);
+	TEST_CHECK(find_padding_option(fixture.received_query,
+	                               fixture.received_len,
+	                               &padding_len));
+	TEST_EXPECT_INT_EQ(wire_read_u16(response), 0xD0A0);
+}
+
+static void
+run_doh_bad_header_rejected(const char *content_type,
+                            const char *content_length)
+{
+	struct doh_fixture fixture;
+	struct sockaddr_in addr;
+	socklen_t          addr_len = sizeof(addr);
+	pthread_t          thread;
+	uint8_t            query[DNS_MAX_MSG_SIZE];
+	uint8_t            response[DNS_MAX_MSG_SIZE];
+	size_t             query_len;
+	size_t             response_len = 0;
+
+	memset(&fixture, 0, sizeof(fixture));
+	fixture.response_content_type   = content_type;
+	fixture.response_content_length = content_length;
+	fixture.send_body               = false;
+	fixture.fd                      = socket(AF_INET, SOCK_STREAM, 0);
+	if (fixture.fd < 0 && (errno == EPERM || errno == EACCES))
+		TEST_SKIP("resolver tests skipped: TCP sockets unavailable");
+	TEST_CHECK(fixture.fd >= 0);
+
+	int optval = 1;
+	setsockopt(fixture.fd, SOL_SOCKET, SO_REUSEADDR,
+	           &optval, sizeof(optval));
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family      = AF_INET;
+	addr.sin_port        = 0;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	TEST_CHECK(bind(fixture.fd, (struct sockaddr *)&addr, sizeof(addr))
+	           == 0);
+	TEST_CHECK(getsockname(fixture.fd, (struct sockaddr *)&addr,
+	                       &addr_len)
+	           == 0);
+	TEST_CHECK(listen(fixture.fd, 1) == 0);
+	fixture.port = ntohs(addr.sin_port);
+
+	fixture.ctx  = SSL_CTX_new(TLS_server_method());
+	TEST_CHECK(fixture.ctx != NULL);
+	SSL_CTX_set_min_proto_version(fixture.ctx, TLS1_2_VERSION);
+	TEST_CHECK(make_selfsigned_cert(fixture.ctx) == 0);
+
+	TEST_CHECK(pthread_create(&thread, NULL, serve_doh_once,
+	                          &fixture)
+	           == 0);
+
+	resolver_set_tls_config(NULL, NULL, true);
+
+	query_len = make_query(query, 0xD0B0, DNS_FLAG_RD, "bad-doh.example");
+
+	char addrs[1][INET6_ADDRSTRLEN];
+	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
+	int rc = resolver_forward_transport(
+	        addrs, 1, fixture.port, DNS_UPSTREAM_TRANSPORT_DOH,
+	        "/dns-query", "localhost", 0, query, query_len,
+	        response, sizeof(response), &response_len);
+
+	TEST_CHECK(pthread_join(thread, NULL) == 0);
+	close(fixture.fd);
+	SSL_CTX_free(fixture.ctx);
+
+	TEST_EXPECT_INT_EQ(rc, -1);
+	TEST_EXPECT_SIZE_EQ(response_len, 0);
+}
+
+static void
+test_doh_transport_rejects_malformed_response_headers(void)
+{
+	run_doh_bad_header_rejected("application/dns-messageXYZ", NULL);
+	run_doh_bad_header_rejected(NULL, "12junk");
 }
 
 /* --- TCP fallback on TC=1 (RFC 7766 §6.2.1) --- */
@@ -1011,9 +1271,10 @@ test_tcp_fallback_on_truncation(void)
 
 	char addrs[1][INET6_ADDRSTRLEN];
 	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
-	rc = resolver_forward(addrs, 1, fx.port, false, false, NULL, NULL, 0,
-	                      query, query_len, response, sizeof(response),
-	                      &response_len);
+	rc = resolver_forward_transport(addrs, 1, fx.port,
+	                                DNS_UPSTREAM_TRANSPORT_PLAIN, NULL,
+	                                NULL, 0, query, query_len, response,
+	                                sizeof(response), &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fx.udp_fd);
@@ -1076,9 +1337,10 @@ test_multi_addr_failover_skips_dead_first(void)
 	snprintf(addrs[0], INET6_ADDRSTRLEN, "192.0.2.1"); /* TEST-NET-1 */
 	snprintf(addrs[1], INET6_ADDRSTRLEN, "127.0.0.1");
 
-	rc = resolver_forward(addrs, 2, ntohs(upstream_addr.sin_port), false,
-	                      false, NULL, NULL, 0, query, query_len, response,
-	                      sizeof(response), &response_len);
+	rc = resolver_forward_transport(addrs, 2, ntohs(upstream_addr.sin_port),
+	                                DNS_UPSTREAM_TRANSPORT_PLAIN, NULL,
+	                                NULL, 0, query, query_len, response,
+	                                sizeof(response), &response_len);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture.fd);
@@ -1301,10 +1563,10 @@ test_resolver_svcb_discovery_parses_metadata(void)
 
 	char addrs[1][INET6_ADDRSTRLEN];
 	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
-	int rc = resolver_discover_svcb(addrs, 1,
-	                                ntohs(upstream_addr.sin_port),
-	                                false, false, NULL, NULL, 0,
-	                                "resolver.example", &result);
+	int rc = resolver_discover_svcb_transport(
+	        addrs, 1, ntohs(upstream_addr.sin_port),
+	        DNS_UPSTREAM_TRANSPORT_PLAIN, NULL, NULL, 0,
+	        "resolver.example", &result);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture.fd);
@@ -1352,10 +1614,10 @@ test_resolver_svcb_discovery_ignores_unusable_records(void)
 
 	char addrs[1][INET6_ADDRSTRLEN];
 	snprintf(addrs[0], INET6_ADDRSTRLEN, "127.0.0.1");
-	int rc = resolver_discover_svcb(addrs, 1,
-	                                ntohs(upstream_addr.sin_port),
-	                                false, false, NULL, NULL, 0,
-	                                "resolver.example", &result);
+	int rc = resolver_discover_svcb_transport(
+	        addrs, 1, ntohs(upstream_addr.sin_port),
+	        DNS_UPSTREAM_TRANSPORT_PLAIN, NULL, NULL, 0,
+	        "resolver.example", &result);
 
 	TEST_CHECK(pthread_join(thread, NULL) == 0);
 	close(fixture.fd);
@@ -1381,6 +1643,8 @@ main(void)
 	test_dot_edns_padding_updates_existing_opt();
 	test_dot_tls_connection_reused_and_padding_is_per_query();
 	test_plain_udp_does_not_add_edns_padding();
+	test_doh_transport_uses_https_path_and_padding();
+	test_doh_transport_rejects_malformed_response_headers();
 	test_tcp_fallback_on_truncation();
 	test_multi_addr_failover_skips_dead_first();
 	test_resolver_svcb_discovery_parses_metadata();

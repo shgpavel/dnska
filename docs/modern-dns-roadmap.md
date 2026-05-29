@@ -94,8 +94,9 @@ Decision: ODoH is not a small extension of the current DoH branch.  It needs an
 HPKE-backed envelope format plus a two-hop HTTP deployment model.  This
 workspace's OpenSSL exposes `<openssl/hpke.h>`, and the compile-only probe
 confirms local access to HPKE setup/seal/export, HKDF, and AEAD APIs.  The
-ODoH/OHTTP message encoding, key configuration parsing, URI template handling,
-and relay/target semantics still need new code.
+ODoH/OHTTP crypto, URI template handling, and relay/target semantics still need
+new code.  `src/odoh.c` now provides standalone RFC 9230-oriented config,
+message, and plaintext codecs, but it is not wired into resolver transport.
 
 Implementation phases:
 
@@ -121,8 +122,9 @@ Implementation phases:
    - Do not cache encrypted ODoH/OHTTP envelopes.  The existing DNS response
      cache may remain a local policy decision after decryption.
 4. Tests:
-   - Add standalone encoding tests for key config parsing and HPKE test vectors
-     before adding network tests.
+   - Standalone ODoH config/message/plaintext codec tests exist in
+     `test/odoh/odoh_test.c`; add HPKE test vectors before adding network
+     tests.
    - Add resolver tests for HTTP status, media type, content length, decrypt
      failure, and successful DNS response extraction.
    - Keep RFC 9230 ODoH and RFC 9458 OHTTP tests separate: OHTTP also needs a

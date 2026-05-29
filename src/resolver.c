@@ -71,6 +71,24 @@ static char                           tls_ca_file[256];
 static char                           tls_auth_name[256];
 static bool                           tls_insecure;
 
+static enum dns_upstream_transport
+resolver_transport_from_legacy(bool upstream_tls, bool upstream_doh)
+{
+	if (upstream_doh)
+		return DNS_UPSTREAM_TRANSPORT_DOH;
+	if (upstream_tls)
+		return DNS_UPSTREAM_TRANSPORT_DOT;
+
+	return DNS_UPSTREAM_TRANSPORT_PLAIN;
+}
+
+static bool
+resolver_transport_is_encrypted(enum dns_upstream_transport transport)
+{
+	return transport == DNS_UPSTREAM_TRANSPORT_DOT
+	       || transport == DNS_UPSTREAM_TRANSPORT_DOH;
+}
+
 void
 resolver_set_tls_config(const char *ca_file, const char *auth_name,
                         bool insecure)
@@ -730,6 +748,60 @@ http_find_header(const char *headers, const char *name)
 	return NULL;
 }
 
+static size_t
+http_header_value_len(const char *value)
+{
+	const char *end = strstr(value, "\r\n");
+	size_t      len;
+
+	if (end == NULL)
+		end = value + strlen(value);
+	len = (size_t)(end - value);
+	while (len > 0 && (value[len - 1] == ' ' || value[len - 1] == '\t'))
+		len--;
+
+	return len;
+}
+
+static bool
+http_content_type_is_dns_message(const char *value)
+{
+	static const char expected[]   = "application/dns-message";
+	size_t            len          = http_header_value_len(value);
+	size_t            expected_len = sizeof(expected) - 1;
+
+	if (len < expected_len)
+		return false;
+	if (strncasecmp(value, expected, expected_len) != 0)
+		return false;
+
+	return len == expected_len || value[expected_len] == ';';
+}
+
+static bool
+http_parse_content_length(const char *value, size_t *out)
+{
+	char              *endptr;
+	unsigned long long parsed;
+
+	if (value == NULL || out == NULL || !isdigit((unsigned char)*value))
+		return false;
+
+	errno  = 0;
+	parsed = strtoull(value, &endptr, 10);
+	if (errno != 0 || endptr == value)
+		return false;
+	while (*endptr == ' ' || *endptr == '\t')
+		endptr++;
+	if (!(endptr[0] == '\r' && endptr[1] == '\n') && *endptr != '\0')
+		return false;
+	if (parsed > SIZE_MAX)
+		return false;
+
+	*out = (size_t)parsed;
+	return true;
+}
+
 /*
  * Forward query to upstream over DNS-over-HTTPS (RFC 8484).  Uses POST
  * with application/dns-message.  hostname is required (Host header +
@@ -799,8 +871,7 @@ forward_doh(const struct sockaddr *upstream, socklen_t upstream_len,
 	}
 
 	const char *ctype = http_find_header(resp_headers, "Content-Type");
-	if (ctype == NULL
-	    || strncasecmp(ctype, "application/dns-message", 23) != 0) {
+	if (ctype == NULL || !http_content_type_is_dns_message(ctype)) {
 		fprintf(stderr,
 		        "resolver: DoH bad Content-Type (need application/"
 		        "dns-message)\n");
@@ -814,7 +885,12 @@ forward_doh(const struct sockaddr *upstream, socklen_t upstream_len,
 		tls_close(ssl, fd);
 		return -1;
 	}
-	size_t content_length = (size_t)strtoul(clen, NULL, 10);
+	size_t content_length = 0;
+	if (!http_parse_content_length(clen, &content_length)) {
+		fprintf(stderr, "resolver: DoH invalid Content-Length\n");
+		tls_close(ssl, fd);
+		return -1;
+	}
 	if (content_length < DNS_HEADER_SIZE
 	    || content_length > response_size) {
 		fprintf(stderr, "resolver: DoH bad body length: %zu\n",
@@ -1369,10 +1445,10 @@ parse_svcb_response(const uint8_t *response, size_t response_len,
 
 static int
 forward_one_address(const char *upstream_addr, uint16_t upstream_port,
-                    bool upstream_tls, bool upstream_doh,
-                    const char    *doh_path,
-                    const char    *upstream_hostname,
-                    uint16_t       edns_padding_block,
+                    enum dns_upstream_transport upstream_transport,
+                    const char                 *doh_path,
+                    const char                 *upstream_hostname,
+                    uint16_t                    edns_padding_block,
                     const uint8_t *query, size_t query_len,
                     uint8_t *response, size_t response_size,
                     size_t *response_len)
@@ -1428,7 +1504,8 @@ forward_one_address(const char *upstream_addr, uint16_t upstream_port,
 	}
 	query_len = forwarded_len;
 
-	if ((upstream_tls || upstream_doh) && edns_padding_block != 0) {
+	if (resolver_transport_is_encrypted(upstream_transport)
+	    && edns_padding_block != 0) {
 		size_t padded_len = add_edns_padding(
 		        forwarded_query, query_len, sizeof(forwarded_query),
 		        edns_padding_block);
@@ -1459,8 +1536,8 @@ forward_one_address(const char *upstream_addr, uint16_t upstream_port,
 		return -1;
 	}
 
-	/* DoH: HTTP POST over TLS */
-	if (upstream_doh) {
+	switch (upstream_transport) {
+	case DNS_UPSTREAM_TRANSPORT_DOH: {
 		int rc = forward_doh((const struct sockaddr *)&ss, ss_len, family,
 		                     upstream_hostname, doh_path,
 		                     forwarded_query, query_len,
@@ -1472,8 +1549,7 @@ forward_one_address(const char *upstream_addr, uint16_t upstream_port,
 		return rc;
 	}
 
-	/* DoT: bypass UDP entirely and go directly to TLS */
-	if (upstream_tls) {
+	case DNS_UPSTREAM_TRANSPORT_DOT: {
 		int rc = forward_tls((const struct sockaddr *)&ss, ss_len, family,
 		                     upstream_hostname,
 		                     forwarded_query, query_len,
@@ -1483,6 +1559,15 @@ forward_one_address(const char *upstream_addr, uint16_t upstream_port,
 			*response_len = dns_strip_response_opt(response,
 			                                       *response_len);
 		return rc;
+	}
+
+	case DNS_UPSTREAM_TRANSPORT_PLAIN:
+		break;
+
+	default:
+		fprintf(stderr, "resolver: invalid upstream transport: %d\n",
+		        (int)upstream_transport);
+		return -1;
 	}
 
 	int fd = socket(family, SOCK_DGRAM, 0);
@@ -1600,15 +1685,16 @@ forward_one_address(const char *upstream_addr, uint16_t upstream_port,
 }
 
 int
-resolver_forward(const char upstream_addrs[][INET6_ADDRSTRLEN],
-                 size_t     upstream_addr_count,
-                 uint16_t upstream_port, bool upstream_tls,
-                 bool upstream_doh, const char *doh_path,
-                 const char    *upstream_hostname,
-                 uint16_t       edns_padding_block,
-                 const uint8_t *query, size_t query_len,
-                 uint8_t *response, size_t response_size,
-                 size_t *response_len)
+resolver_forward_transport(const char                  upstream_addrs[][INET6_ADDRSTRLEN],
+                           size_t                      upstream_addr_count,
+                           uint16_t                    upstream_port,
+                           enum dns_upstream_transport upstream_transport,
+                           const char                 *doh_path,
+                           const char                 *upstream_hostname,
+                           uint16_t                    edns_padding_block,
+                           const uint8_t *query, size_t query_len,
+                           uint8_t *response, size_t response_size,
+                           size_t *response_len)
 {
 	if (upstream_addr_count == 0) {
 		fprintf(stderr, "resolver: no upstream addresses\n");
@@ -1617,7 +1703,7 @@ resolver_forward(const char upstream_addrs[][INET6_ADDRSTRLEN],
 
 	for (size_t i = 0; i < upstream_addr_count; i++) {
 		int rc = forward_one_address(upstream_addrs[i], upstream_port,
-		                             upstream_tls, upstream_doh,
+		                             upstream_transport,
 		                             doh_path, upstream_hostname,
 		                             edns_padding_block,
 		                             query, query_len,
@@ -1635,14 +1721,31 @@ resolver_forward(const char upstream_addrs[][INET6_ADDRSTRLEN],
 }
 
 int
-resolver_discover_svcb(const char upstream_addrs[][INET6_ADDRSTRLEN],
-                       size_t     upstream_addr_count,
-                       uint16_t upstream_port, bool upstream_tls,
-                       bool upstream_doh, const char *doh_path,
-                       const char                       *upstream_hostname,
-                       uint16_t                          edns_padding_block,
-                       const char                       *resolver_name,
-                       struct resolver_discovery_result *result)
+resolver_forward(const char upstream_addrs[][INET6_ADDRSTRLEN],
+                 size_t     upstream_addr_count,
+                 uint16_t upstream_port, bool upstream_tls,
+                 bool upstream_doh, const char *doh_path,
+                 const char    *upstream_hostname,
+                 uint16_t       edns_padding_block,
+                 const uint8_t *query, size_t query_len,
+                 uint8_t *response, size_t response_size,
+                 size_t *response_len)
+{
+	return resolver_forward_transport(
+	        upstream_addrs, upstream_addr_count, upstream_port,
+	        resolver_transport_from_legacy(upstream_tls, upstream_doh),
+	        doh_path, upstream_hostname, edns_padding_block, query,
+	        query_len, response, response_size, response_len);
+}
+
+int
+resolver_discover_svcb_transport(
+        const char upstream_addrs[][INET6_ADDRSTRLEN],
+        size_t upstream_addr_count, uint16_t upstream_port,
+        enum dns_upstream_transport upstream_transport,
+        const char *doh_path, const char *upstream_hostname,
+        uint16_t edns_padding_block, const char *resolver_name,
+        struct resolver_discovery_result *result)
 {
 	char     qname[DNS_MAX_NAME_LEN + 1];
 	uint8_t  query[DNS_MAX_MSG_SIZE];
@@ -1664,13 +1767,13 @@ resolver_discover_svcb(const char upstream_addrs[][INET6_ADDRSTRLEN],
 	if (query_len == 0)
 		return -1;
 
-	if (resolver_forward(upstream_addrs, upstream_addr_count,
-	                     upstream_port, upstream_tls, upstream_doh,
-	                     doh_path, upstream_hostname,
-	                     edns_padding_block,
-	                     query, query_len,
-	                     response, sizeof(response),
-	                     &response_len)
+	if (resolver_forward_transport(upstream_addrs, upstream_addr_count,
+	                               upstream_port, upstream_transport,
+	                               doh_path, upstream_hostname,
+	                               edns_padding_block,
+	                               query, query_len,
+	                               response, sizeof(response),
+	                               &response_len)
 	    < 0)
 		return -1;
 
@@ -1680,4 +1783,21 @@ resolver_discover_svcb(const char upstream_addrs[][INET6_ADDRSTRLEN],
 		return 0;
 
 	return parse_svcb_response(response, response_len, result);
+}
+
+int
+resolver_discover_svcb(const char upstream_addrs[][INET6_ADDRSTRLEN],
+                       size_t     upstream_addr_count,
+                       uint16_t upstream_port, bool upstream_tls,
+                       bool upstream_doh, const char *doh_path,
+                       const char                       *upstream_hostname,
+                       uint16_t                          edns_padding_block,
+                       const char                       *resolver_name,
+                       struct resolver_discovery_result *result)
+{
+	return resolver_discover_svcb_transport(
+	        upstream_addrs, upstream_addr_count, upstream_port,
+	        resolver_transport_from_legacy(upstream_tls, upstream_doh),
+	        doh_path, upstream_hostname, edns_padding_block, resolver_name,
+	        result);
 }

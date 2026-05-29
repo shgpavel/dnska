@@ -3,9 +3,15 @@
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include <openssl/bn.h>
+#include <openssl/core_names.h>
+#include <openssl/ecdsa.h>
 #include <openssl/evp.h>
+#include <openssl/param_build.h>
+#include <openssl/rsa.h>
 
 #include "dns.h"
 #include "dnssec.h"
@@ -550,6 +556,703 @@ dnssec_ds_matches_dnskey(const char                 *owner_name,
 	*matches = digest_len == ds->digest_len
 	           && memcmp(digest, ds->digest, digest_len) == 0;
 	return DNSSEC_OK;
+}
+
+static bool
+dnssec_time_lte(uint32_t a, uint32_t b)
+{
+	return a == b || (uint32_t)(b - a) < 0x80000000u;
+}
+
+static bool
+dnssec_time_in_rrsig_window(uint32_t now, const struct dnssec_rrsig *rrsig)
+{
+	return dnssec_time_lte(rrsig->signature_inception, now)
+	       && dnssec_time_lte(now, rrsig->signature_expiration);
+}
+
+static bool
+rrsig_algorithm_supported(uint8_t algorithm)
+{
+	return algorithm == DNSSEC_ALGORITHM_RSASHA256
+	       || algorithm == DNSSEC_ALGORITHM_ECDSAP256SHA256
+	       || algorithm == DNSSEC_ALGORITHM_ED25519;
+}
+
+static bool
+rrsig_type_has_opaque_rdata(uint16_t type)
+{
+	switch (type) {
+	case DNS_TYPE_A:
+	case DNS_TYPE_AAAA:
+	case DNS_TYPE_TXT:
+	case DNS_TYPE_SSHFP:
+	case DNS_TYPE_DS:
+	case DNS_TYPE_DNSKEY:
+	case DNS_TYPE_NSEC3:
+	case DNS_TYPE_TLSA:
+	case DNS_TYPE_CDS:
+	case DNS_TYPE_CDNSKEY:
+	case DNS_TYPE_ZONEMD:
+	case DNS_TYPE_CAA:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int
+validate_opaque_rdata_rr(const struct dnssec_canonical_rr *rr)
+{
+	if (rr->rdata == NULL && rr->rdata_len != 0)
+		return DNSSEC_ERR_MALFORMED;
+
+	switch (rr->type) {
+	case DNS_TYPE_A:
+		return rr->rdata_len == 4 ? DNSSEC_OK : DNSSEC_ERR_MALFORMED;
+	case DNS_TYPE_AAAA:
+		return rr->rdata_len == 16 ? DNSSEC_OK : DNSSEC_ERR_MALFORMED;
+	case DNS_TYPE_DS:
+	case DNS_TYPE_CDS: {
+		struct dnssec_ds ds;
+		return dnssec_parse_ds(rr->rdata, rr->rdata_len, &ds);
+	}
+	case DNS_TYPE_DNSKEY:
+	case DNS_TYPE_CDNSKEY: {
+		struct dnssec_dnskey dnskey;
+		return dnssec_parse_dnskey(rr->rdata, rr->rdata_len,
+		                           &dnskey);
+	}
+	case DNS_TYPE_NSEC3: {
+		struct dnssec_nsec3 nsec3;
+		return dnssec_parse_nsec3(rr->rdata, rr->rdata_len, &nsec3);
+	}
+	default:
+		return DNSSEC_OK;
+	}
+}
+
+static bool
+dnskey_matches_rdata(const struct dnssec_dnskey *dnskey,
+                     const struct dnssec_dnskey *parsed)
+{
+	if (dnskey->flags != parsed->flags
+	    || dnskey->protocol != parsed->protocol
+	    || dnskey->algorithm != parsed->algorithm
+	    || dnskey->public_key_len != parsed->public_key_len)
+		return false;
+
+	return memcmp(dnskey->public_key, parsed->public_key,
+	              dnskey->public_key_len)
+	       == 0;
+}
+
+static int
+canonical_name_label_count(const uint8_t *name, size_t name_len,
+                           size_t *labels)
+{
+	size_t pos   = 0;
+	size_t count = 0;
+
+	if (name == NULL || labels == NULL || name_len == 0)
+		return DNSSEC_ERR_MALFORMED;
+
+	while (pos < name_len) {
+		uint8_t len = name[pos];
+
+		if (len == 0) {
+			if (pos + 1 != name_len)
+				return DNSSEC_ERR_MALFORMED;
+			*labels = count;
+			return DNSSEC_OK;
+		}
+
+		if ((len & 0xC0) != 0 || len > DNS_MAX_LABEL_LEN)
+			return DNSSEC_ERR_MALFORMED;
+		if (pos + 1 + len >= name_len)
+			return DNSSEC_ERR_MALFORMED;
+
+		pos += 1 + len;
+		count++;
+	}
+
+	return DNSSEC_ERR_MALFORMED;
+}
+
+static int
+canonical_name_suffix_for_labels(const uint8_t *name, size_t name_len,
+                                 size_t labels, const uint8_t **suffix,
+                                 size_t *suffix_len)
+{
+	size_t total_labels = 0;
+	int    rc           = canonical_name_label_count(name, name_len,
+	                                                 &total_labels);
+	if (rc != DNSSEC_OK)
+		return rc;
+	if (labels > total_labels)
+		return DNSSEC_ERR_MALFORMED;
+	if (labels == total_labels) {
+		*suffix     = name;
+		*suffix_len = name_len;
+		return DNSSEC_OK;
+	}
+
+	size_t skip = total_labels - labels;
+	size_t pos  = 0;
+	for (size_t i = 0; i < skip; i++)
+		pos += 1 + name[pos];
+
+	*suffix     = name + pos;
+	*suffix_len = name_len - pos;
+	return DNSSEC_OK;
+}
+
+static int
+rrsig_rr_owner(const struct dnssec_canonical_rr *rr,
+               const struct dnssec_rrsig        *rrsig,
+               uint8_t *owner, size_t owner_size, size_t *owner_len)
+{
+	const uint8_t *suffix          = NULL;
+	size_t         suffix_len      = 0;
+	size_t         rr_owner_labels = 0;
+
+	int            rc              = canonical_name_label_count(rr->owner, rr->owner_len,
+	                                                            &rr_owner_labels);
+	if (rc != DNSSEC_OK)
+		return rc;
+	if (rrsig->labels > rr_owner_labels)
+		return DNSSEC_ERR_MALFORMED;
+
+	if (rrsig->labels == rr_owner_labels) {
+		if (rr->owner_len > owner_size)
+			return DNSSEC_ERR_NOBUFS;
+		memcpy(owner, rr->owner, rr->owner_len);
+		*owner_len = rr->owner_len;
+		return DNSSEC_OK;
+	}
+
+	rc = canonical_name_suffix_for_labels(rr->owner, rr->owner_len,
+	                                      rrsig->labels, &suffix,
+	                                      &suffix_len);
+	if (rc != DNSSEC_OK)
+		return rc;
+	if (2 + suffix_len > owner_size)
+		return DNSSEC_ERR_NOBUFS;
+
+	owner[0] = 1;
+	owner[1] = '*';
+	memcpy(owner + 2, suffix, suffix_len);
+	*owner_len = 2 + suffix_len;
+	return DNSSEC_OK;
+}
+
+static int
+rrsig_rr_compare(const struct dnssec_canonical_rr *a,
+                 const struct dnssec_canonical_rr *b)
+{
+	size_t min_len = a->rdata_len < b->rdata_len ? a->rdata_len : b->rdata_len;
+	int    cmp     = min_len == 0 ? 0 : memcmp(a->rdata, b->rdata, min_len);
+
+	if (cmp != 0)
+		return cmp;
+	if (a->rdata_len < b->rdata_len)
+		return -1;
+	if (a->rdata_len > b->rdata_len)
+		return 1;
+	return 0;
+}
+
+static void
+sort_rrsig_rrset_indices(const struct dnssec_canonical_rr *rrset,
+                         size_t rr_count, size_t *indices)
+{
+	for (size_t i = 0; i < rr_count; i++)
+		indices[i] = i;
+
+	for (size_t i = 1; i < rr_count; i++) {
+		size_t idx = indices[i];
+		size_t j   = i;
+		while (j > 0
+		       && rrsig_rr_compare(&rrset[idx],
+		                           &rrset[indices[j - 1]])
+		                  < 0) {
+			indices[j] = indices[j - 1];
+			j--;
+		}
+		indices[j] = idx;
+	}
+}
+
+static int
+add_len(size_t *total, size_t add)
+{
+	if (add > SIZE_MAX - *total)
+		return DNSSEC_ERR_NOBUFS;
+	*total += add;
+	return DNSSEC_OK;
+}
+
+static int
+rrsig_signed_data_len(const struct dnssec_canonical_rr *rrset,
+                      size_t rr_count, size_t signer_len,
+                      size_t  rr_owner_len,
+                      size_t *signed_len)
+{
+	size_t total = 18;
+
+	if (add_len(&total, signer_len) != DNSSEC_OK)
+		return DNSSEC_ERR_NOBUFS;
+
+	for (size_t i = 0; i < rr_count; i++) {
+		if (rrset[i].rdata_len > UINT16_MAX)
+			return DNSSEC_ERR_MALFORMED;
+		if (add_len(&total, rr_owner_len) != DNSSEC_OK
+		    || add_len(&total, 10) != DNSSEC_OK
+		    || add_len(&total, rrset[i].rdata_len) != DNSSEC_OK)
+			return DNSSEC_ERR_NOBUFS;
+	}
+
+	if (total > DNSSEC_MAX_RRSIG_SIGNED_DATA_LEN)
+		return DNSSEC_ERR_NOBUFS;
+
+	*signed_len = total;
+	return DNSSEC_OK;
+}
+
+static void
+append_rrsig_header(uint8_t *buf, const struct dnssec_rrsig *rrsig,
+                    const uint8_t *signer, size_t signer_len)
+{
+	wire_write_u16(buf, rrsig->type_covered);
+	buf[2] = rrsig->algorithm;
+	buf[3] = rrsig->labels;
+	wire_write_u32(buf + 4, rrsig->original_ttl);
+	wire_write_u32(buf + 8, rrsig->signature_expiration);
+	wire_write_u32(buf + 12, rrsig->signature_inception);
+	wire_write_u16(buf + 16, rrsig->key_tag);
+	memcpy(buf + 18, signer, signer_len);
+}
+
+static int
+build_rrsig_signed_data(const struct dnssec_canonical_rr *rrset,
+                        size_t                            rr_count,
+                        const struct dnssec_rrsig        *rrsig,
+                        uint8_t **signed_data, size_t *signed_len)
+{
+	uint8_t signer[DNS_MAX_NAME_LEN + 1];
+	uint8_t rr_owner[DNS_MAX_NAME_LEN + 1];
+	size_t  signer_len   = 0;
+	size_t  rr_owner_len = 0;
+	size_t  indices[DNSSEC_MAX_RRSIG_RRSET_RRS];
+	size_t  total_len = 0;
+
+	int     rc        = dnssec_canonical_name_from_text(rrsig->signer_name, signer,
+	                                                    sizeof(signer),
+	                                                    &signer_len);
+	if (rc != DNSSEC_OK)
+		return rc;
+	rc = rrsig_rr_owner(&rrset[0], rrsig, rr_owner, sizeof(rr_owner),
+	                    &rr_owner_len);
+	if (rc != DNSSEC_OK)
+		return rc;
+
+	rc = rrsig_signed_data_len(rrset, rr_count, signer_len,
+	                           rr_owner_len, &total_len);
+	if (rc != DNSSEC_OK)
+		return rc;
+
+	uint8_t *data = malloc(total_len);
+	if (data == NULL)
+		return DNSSEC_ERR_NOBUFS;
+
+	append_rrsig_header(data, rrsig, signer, signer_len);
+	size_t pos = 18 + signer_len;
+
+	sort_rrsig_rrset_indices(rrset, rr_count, indices);
+	for (size_t i = 0; i < rr_count; i++) {
+		const struct dnssec_canonical_rr *rr = &rrset[indices[i]];
+
+		memcpy(data + pos, rr_owner, rr_owner_len);
+		pos += rr_owner_len;
+		wire_write_u16(data + pos, rr->type);
+		wire_write_u16(data + pos + 2, rr->rrclass);
+		wire_write_u32(data + pos + 4, rrsig->original_ttl);
+		wire_write_u16(data + pos + 8, (uint16_t)rr->rdata_len);
+		pos += 10;
+		if (rr->rdata_len != 0)
+			memcpy(data + pos, rr->rdata, rr->rdata_len);
+		pos += rr->rdata_len;
+	}
+
+	*signed_data = data;
+	*signed_len  = total_len;
+	return DNSSEC_OK;
+}
+
+static EVP_PKEY *
+dnssec_rsa_pkey_from_dnskey(const struct dnssec_dnskey *dnskey)
+{
+	if (dnskey->public_key_len < 3)
+		return NULL;
+
+	size_t   pos          = 0;
+	uint16_t exponent_len = dnskey->public_key[pos++];
+
+	if (exponent_len == 0) {
+		if (dnskey->public_key_len < 3)
+			return NULL;
+		exponent_len  = wire_read_u16(dnskey->public_key + pos);
+		pos          += 2;
+	}
+
+	if (exponent_len == 0
+	    || exponent_len > dnskey->public_key_len - pos)
+		return NULL;
+
+	const uint8_t *exponent     = dnskey->public_key + pos;
+	pos                        += exponent_len;
+	const uint8_t *modulus      = dnskey->public_key + pos;
+	size_t         modulus_len  = dnskey->public_key_len - pos;
+	if (modulus_len == 0)
+		return NULL;
+
+	BIGNUM *e = BN_bin2bn(exponent, exponent_len, NULL);
+	BIGNUM *n = BN_bin2bn(modulus, modulus_len, NULL);
+	if (e == NULL || n == NULL) {
+		BN_free(e);
+		BN_free(n);
+		return NULL;
+	}
+
+	OSSL_PARAM_BLD *bld    = OSSL_PARAM_BLD_new();
+	EVP_PKEY_CTX   *ctx    = NULL;
+	OSSL_PARAM     *params = NULL;
+	EVP_PKEY       *pkey   = NULL;
+	bool            ok     = bld != NULL;
+
+	if (ok)
+		ok = OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E,
+		                            e)
+		             == 1
+		     && OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N,
+		                               n)
+		                == 1;
+	if (ok) {
+		params = OSSL_PARAM_BLD_to_param(bld);
+		ok     = params != NULL;
+	}
+	if (ok) {
+		ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+		ok  = ctx != NULL
+		      && EVP_PKEY_fromdata_init(ctx) == 1
+		      && EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_PUBLIC_KEY,
+		                           params)
+		                 == 1;
+	}
+
+	EVP_PKEY_CTX_free(ctx);
+	OSSL_PARAM_free(params);
+	OSSL_PARAM_BLD_free(bld);
+	BN_free(e);
+	BN_free(n);
+	if (!ok) {
+		EVP_PKEY_free(pkey);
+		return NULL;
+	}
+	return pkey;
+}
+
+static EVP_PKEY *
+dnssec_ecdsa_p256_pkey_from_dnskey(const struct dnssec_dnskey *dnskey)
+{
+	if (dnskey->public_key_len != 64)
+		return NULL;
+
+	uint8_t point[65];
+	point[0] = 0x04;
+	memcpy(point + 1, dnskey->public_key, dnskey->public_key_len);
+
+	char       group[]  = "prime256v1";
+	OSSL_PARAM params[] = {
+		OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME,
+		                                 group, 0),
+		OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY,
+		                                  point, sizeof(point)),
+		OSSL_PARAM_construct_end(),
+	};
+	EVP_PKEY_CTX *ctx  = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+	EVP_PKEY     *pkey = NULL;
+	bool          ok   = ctx != NULL
+	                     && EVP_PKEY_fromdata_init(ctx) == 1
+	                     && EVP_PKEY_fromdata(ctx, &pkey,
+	                                          EVP_PKEY_PUBLIC_KEY,
+	                                          params)
+	                                == 1;
+	EVP_PKEY_CTX_free(ctx);
+	if (!ok) {
+		EVP_PKEY_free(pkey);
+		return NULL;
+	}
+	return pkey;
+}
+
+static EVP_PKEY *
+dnssec_ed25519_pkey_from_dnskey(const struct dnssec_dnskey *dnskey)
+{
+	if (dnskey->public_key_len != 32)
+		return NULL;
+	return EVP_PKEY_new_raw_public_key_ex(NULL, "ED25519", NULL,
+	                                      dnskey->public_key,
+	                                      dnskey->public_key_len);
+}
+
+static int
+ecdsa_p1363_to_der(const uint8_t *sig, size_t sig_len,
+                   uint8_t **der, size_t *der_len)
+{
+	if (sig_len != 64)
+		return DNSSEC_ERR_MALFORMED;
+
+	ECDSA_SIG *ecdsa_sig = ECDSA_SIG_new();
+	BIGNUM    *r         = BN_bin2bn(sig, 32, NULL);
+	BIGNUM    *s         = BN_bin2bn(sig + 32, 32, NULL);
+	if (ecdsa_sig == NULL || r == NULL || s == NULL) {
+		ECDSA_SIG_free(ecdsa_sig);
+		BN_free(r);
+		BN_free(s);
+		return DNSSEC_ERR_NOBUFS;
+	}
+	if (ECDSA_SIG_set0(ecdsa_sig, r, s) != 1) {
+		ECDSA_SIG_free(ecdsa_sig);
+		BN_free(r);
+		BN_free(s);
+		return DNSSEC_ERR_NOBUFS;
+	}
+	r               = NULL;
+	s               = NULL;
+
+	int encoded_len = i2d_ECDSA_SIG(ecdsa_sig, NULL);
+	if (encoded_len <= 0) {
+		ECDSA_SIG_free(ecdsa_sig);
+		return DNSSEC_ERR_MALFORMED;
+	}
+
+	uint8_t *encoded = malloc((size_t)encoded_len);
+	if (encoded == NULL) {
+		ECDSA_SIG_free(ecdsa_sig);
+		return DNSSEC_ERR_NOBUFS;
+	}
+
+	uint8_t *p = encoded;
+	if (i2d_ECDSA_SIG(ecdsa_sig, &p) != encoded_len) {
+		free(encoded);
+		ECDSA_SIG_free(ecdsa_sig);
+		return DNSSEC_ERR_MALFORMED;
+	}
+
+	ECDSA_SIG_free(ecdsa_sig);
+	*der     = encoded;
+	*der_len = (size_t)encoded_len;
+	return DNSSEC_OK;
+}
+
+static int
+verify_digest_signature(EVP_PKEY *pkey, const EVP_MD *md, bool rsa,
+                        const uint8_t *signature, size_t signature_len,
+                        const uint8_t *signed_data, size_t signed_len,
+                        bool *verified)
+{
+	EVP_MD_CTX   *ctx      = EVP_MD_CTX_new();
+	EVP_PKEY_CTX *pkey_ctx = NULL;
+
+	if (ctx == NULL)
+		return DNSSEC_ERR_NOBUFS;
+
+	bool ok = EVP_DigestVerifyInit(ctx, &pkey_ctx, md, NULL, pkey) == 1;
+	if (ok && rsa)
+		ok = EVP_PKEY_CTX_set_rsa_padding(pkey_ctx,
+		                                  RSA_PKCS1_PADDING)
+		     == 1;
+	if (ok)
+		ok = EVP_DigestVerifyUpdate(ctx, signed_data, signed_len) == 1;
+
+	int final_rc = 0;
+	if (ok)
+		final_rc = EVP_DigestVerifyFinal(ctx, signature,
+		                                 signature_len);
+	EVP_MD_CTX_free(ctx);
+
+	if (!ok)
+		return DNSSEC_ERR_MALFORMED;
+
+	*verified = final_rc == 1;
+	return DNSSEC_OK;
+}
+
+static int
+verify_ed25519_signature(EVP_PKEY *pkey, const uint8_t *signature,
+                         size_t         signature_len,
+                         const uint8_t *signed_data, size_t signed_len,
+                         bool *verified)
+{
+	EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+	if (ctx == NULL)
+		return DNSSEC_ERR_NOBUFS;
+
+	bool ok = EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1;
+	int  rc = 0;
+	if (ok)
+		rc = EVP_DigestVerify(ctx, signature, signature_len,
+		                      signed_data, signed_len);
+	EVP_MD_CTX_free(ctx);
+
+	if (!ok)
+		return DNSSEC_ERR_MALFORMED;
+
+	*verified = rc == 1;
+	return DNSSEC_OK;
+}
+
+static int
+verify_rrsig_crypto(const struct dnssec_rrsig  *rrsig,
+                    const struct dnssec_dnskey *dnskey,
+                    const uint8_t *signed_data, size_t signed_len,
+                    bool *verified)
+{
+	EVP_PKEY *pkey = NULL;
+	int       rc   = DNSSEC_OK;
+
+	switch (rrsig->algorithm) {
+	case DNSSEC_ALGORITHM_RSASHA256:
+		pkey = dnssec_rsa_pkey_from_dnskey(dnskey);
+		if (pkey == NULL)
+			return DNSSEC_ERR_MALFORMED;
+		rc = verify_digest_signature(pkey, EVP_sha256(), true,
+		                             rrsig->signature,
+		                             rrsig->signature_len,
+		                             signed_data, signed_len,
+		                             verified);
+		break;
+	case DNSSEC_ALGORITHM_ECDSAP256SHA256: {
+		uint8_t *der_sig = NULL;
+		size_t   der_len = 0;
+
+		pkey             = dnssec_ecdsa_p256_pkey_from_dnskey(dnskey);
+		if (pkey == NULL)
+			return DNSSEC_ERR_MALFORMED;
+		rc = ecdsa_p1363_to_der(rrsig->signature,
+		                        rrsig->signature_len, &der_sig,
+		                        &der_len);
+		if (rc == DNSSEC_OK) {
+			rc = verify_digest_signature(pkey, EVP_sha256(), false,
+			                             der_sig, der_len,
+			                             signed_data, signed_len,
+			                             verified);
+		}
+		free(der_sig);
+		break;
+	}
+	case DNSSEC_ALGORITHM_ED25519:
+		pkey = dnssec_ed25519_pkey_from_dnskey(dnskey);
+		if (pkey == NULL)
+			return DNSSEC_ERR_MALFORMED;
+		rc = verify_ed25519_signature(pkey, rrsig->signature,
+		                              rrsig->signature_len,
+		                              signed_data, signed_len,
+		                              verified);
+		break;
+	default:
+		rc = DNSSEC_ERR_UNSUPPORTED;
+		break;
+	}
+
+	EVP_PKEY_free(pkey);
+	return rc;
+}
+
+int
+dnssec_verify_rrsig(const struct dnssec_canonical_rr *rrset,
+                    size_t rr_count, const struct dnssec_rrsig *rrsig,
+                    const char                 *dnskey_owner_name,
+                    const struct dnssec_dnskey *dnskey,
+                    const uint8_t *dnskey_rdata, size_t dnskey_rdata_len,
+                    uint32_t validation_time, bool *verified)
+{
+	uint8_t              signer_name[DNS_MAX_NAME_LEN + 1];
+	uint8_t              dnskey_owner[DNS_MAX_NAME_LEN + 1];
+	size_t               signer_name_len  = 0;
+	size_t               dnskey_owner_len = 0;
+	uint8_t             *signed_data      = NULL;
+	size_t               signed_len       = 0;
+	struct dnssec_dnskey parsed_dnskey;
+
+	if (rrset == NULL || rr_count == 0 || rr_count > DNSSEC_MAX_RRSIG_RRSET_RRS || rrsig == NULL || dnskey_owner_name == NULL || dnskey == NULL || dnskey_rdata == NULL || verified == NULL)
+		return DNSSEC_ERR_MALFORMED;
+
+	*verified = false;
+
+	if (!rrsig_algorithm_supported(rrsig->algorithm))
+		return DNSSEC_ERR_UNSUPPORTED;
+	if (!rrsig_type_has_opaque_rdata(rrsig->type_covered))
+		return DNSSEC_ERR_UNSUPPORTED;
+
+	if (dnskey_rdata_len < 4
+	    || dnskey->public_key == NULL
+	    || dnskey->public_key_len == 0)
+		return DNSSEC_ERR_MALFORMED;
+
+	int rc = dnssec_parse_dnskey(dnskey_rdata, dnskey_rdata_len,
+	                             &parsed_dnskey);
+	if (rc != DNSSEC_OK)
+		return rc;
+	if (!dnskey_matches_rdata(dnskey, &parsed_dnskey))
+		return DNSSEC_ERR_MALFORMED;
+
+	rc = dnssec_canonical_name_from_text(rrsig->signer_name,
+	                                     signer_name,
+	                                     sizeof(signer_name),
+	                                     &signer_name_len);
+	if (rc != DNSSEC_OK)
+		return rc;
+	rc = dnssec_canonical_name_from_text(dnskey_owner_name,
+	                                     dnskey_owner,
+	                                     sizeof(dnskey_owner),
+	                                     &dnskey_owner_len);
+	if (rc != DNSSEC_OK)
+		return rc;
+
+	if (!dnssec_canonical_name_equal(signer_name, signer_name_len,
+	                                 dnskey_owner, dnskey_owner_len))
+		return DNSSEC_OK;
+	if (!dnssec_time_in_rrsig_window(validation_time, rrsig))
+		return DNSSEC_OK;
+	if (parsed_dnskey.algorithm != rrsig->algorithm
+	    || parsed_dnskey.protocol != 3
+	    || rrsig->key_tag != dnssec_dnskey_key_tag(dnskey_rdata, dnskey_rdata_len))
+		return DNSSEC_OK;
+
+	for (size_t i = 0; i < rr_count; i++) {
+		const struct dnssec_canonical_rr *rr = &rrset[i];
+
+		if (!dnssec_canonical_rr_same_rrset(&rrset[0], rr))
+			return DNSSEC_ERR_MALFORMED;
+		if (rr->type != rrsig->type_covered)
+			return DNSSEC_ERR_MALFORMED;
+		if (rr->rdata_len > UINT16_MAX)
+			return DNSSEC_ERR_MALFORMED;
+
+		rc = validate_opaque_rdata_rr(rr);
+		if (rc != DNSSEC_OK)
+			return rc;
+	}
+
+	rc = build_rrsig_signed_data(rrset, rr_count, rrsig,
+	                             &signed_data, &signed_len);
+	if (rc == DNSSEC_OK)
+		rc = verify_rrsig_crypto(rrsig, &parsed_dnskey, signed_data,
+		                         signed_len, verified);
+	free(signed_data);
+	return rc;
 }
 
 int

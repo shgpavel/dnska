@@ -101,6 +101,18 @@ test_invalid_listen_mode_rejected(void)
 }
 
 static void
+test_invalid_upstream_transport_rejected(void)
+{
+	struct dns_config cfg;
+	init_config(&cfg);
+
+	TEST_CHECK(try_load_config_text("[dns]\n"
+	                                "upstream_transport = doq\n",
+	                                &cfg)
+	           < 0);
+}
+
+static void
 test_invalid_doh_listen_port_rejected(void)
 {
 	struct dns_config cfg;
@@ -121,6 +133,8 @@ test_transport_defaults_legacy_dot_auto(void)
 
 	config_apply_transport_defaults(&cfg, false);
 
+	TEST_EXPECT_INT_EQ(cfg.upstream_transport,
+	                   DNS_UPSTREAM_TRANSPORT_DOT);
 	TEST_EXPECT_INT_EQ(config_effective_listen_mode(&cfg),
 	                   DNS_LISTEN_DOT);
 	TEST_EXPECT_INT_EQ(cfg.listen_port, 853);
@@ -137,6 +151,8 @@ test_transport_defaults_plain_listener_dot_upstream(void)
 
 	config_apply_transport_defaults(&cfg, false);
 
+	TEST_EXPECT_INT_EQ(cfg.upstream_transport,
+	                   DNS_UPSTREAM_TRANSPORT_DOT);
 	TEST_EXPECT_INT_EQ(config_effective_listen_mode(&cfg),
 	                   DNS_LISTEN_PLAIN);
 	TEST_EXPECT_INT_EQ(cfg.listen_port, 53);
@@ -153,12 +169,76 @@ test_transport_defaults_dot_listener_doh_upstream(void)
 
 	config_apply_transport_defaults(&cfg, false);
 
+	TEST_EXPECT_INT_EQ(cfg.upstream_transport,
+	                   DNS_UPSTREAM_TRANSPORT_DOH);
 	TEST_EXPECT_INT_EQ(config_effective_listen_mode(&cfg),
 	                   DNS_LISTEN_DOT);
 	TEST_CHECK(cfg.upstream_tls);
+	TEST_CHECK(cfg.upstream_doh);
 	TEST_EXPECT_INT_EQ(cfg.listen_port, 853);
 	TEST_EXPECT_INT_EQ(cfg.upstream_port, 443);
 	TEST_EXPECT_STR_EQ(cfg.doh_path, "/dns-query");
+}
+
+static void
+test_transport_selector_config_doh(void)
+{
+	struct dns_config cfg;
+	init_config(&cfg);
+
+	load_config_text("[dns]\n"
+	                 "upstream_transport = doh\n"
+	                 "doh_path = /dns-alt\n",
+	                 &cfg);
+
+	config_apply_transport_defaults(&cfg, false);
+
+	TEST_EXPECT_INT_EQ(cfg.upstream_transport,
+	                   DNS_UPSTREAM_TRANSPORT_DOH);
+	TEST_CHECK(cfg.upstream_transport_explicit);
+	TEST_CHECK(cfg.upstream_tls);
+	TEST_CHECK(cfg.upstream_doh);
+	TEST_EXPECT_INT_EQ(cfg.upstream_port, 443);
+	TEST_EXPECT_STR_EQ(cfg.doh_path, "/dns-alt");
+}
+
+static void
+test_transport_selector_plain_overrides_hostname_default(void)
+{
+	struct dns_config cfg;
+	init_config(&cfg);
+	cfg.upstream_transport          = DNS_UPSTREAM_TRANSPORT_PLAIN;
+	cfg.upstream_transport_explicit = true;
+
+	config_apply_transport_defaults(&cfg, true);
+
+	TEST_EXPECT_INT_EQ(cfg.upstream_transport,
+	                   DNS_UPSTREAM_TRANSPORT_PLAIN);
+	TEST_CHECK(!cfg.upstream_tls);
+	TEST_CHECK(!cfg.upstream_doh);
+	TEST_EXPECT_INT_EQ(config_effective_listen_mode(&cfg),
+	                   DNS_LISTEN_PLAIN);
+	TEST_EXPECT_INT_EQ(cfg.upstream_port, 53);
+}
+
+static void
+test_transport_selector_conflicts_rejected(void)
+{
+	struct dns_config cfg;
+	init_config(&cfg);
+
+	TEST_CHECK(try_load_config_text("[dns]\n"
+	                                "upstream_transport = plain\n"
+	                                "upstream_tls = true\n",
+	                                &cfg)
+	           < 0);
+
+	init_config(&cfg);
+	TEST_CHECK(try_load_config_text("[dns]\n"
+	                                "upstream_transport = dot\n"
+	                                "upstream_doh = true\n",
+	                                &cfg)
+	           < 0);
 }
 
 static void
@@ -173,6 +253,8 @@ test_explicit_ports_survive_hostname_defaults(void)
 
 	config_apply_transport_defaults(&cfg, true);
 
+	TEST_EXPECT_INT_EQ(cfg.upstream_transport,
+	                   DNS_UPSTREAM_TRANSPORT_DOT);
 	TEST_CHECK(cfg.upstream_tls);
 	TEST_EXPECT_INT_EQ(config_effective_listen_mode(&cfg),
 	                   DNS_LISTEN_DOT);
@@ -244,10 +326,14 @@ main(void)
 	test_listen_mode_and_semicolon_comments();
 	test_doh_listener_config();
 	test_invalid_listen_mode_rejected();
+	test_invalid_upstream_transport_rejected();
 	test_invalid_doh_listen_port_rejected();
 	test_transport_defaults_legacy_dot_auto();
 	test_transport_defaults_plain_listener_dot_upstream();
 	test_transport_defaults_dot_listener_doh_upstream();
+	test_transport_selector_config_doh();
+	test_transport_selector_plain_overrides_hostname_default();
+	test_transport_selector_conflicts_rejected();
 	test_explicit_ports_survive_hostname_defaults();
 	test_edns_padding_and_discovery_config();
 	test_edns_padding_default_block();

@@ -46,6 +46,8 @@ sudo ./build/dnska -u dns.google --listen-mode plain
                                                 # plain listener, DoT upstream
 sudo ./build/dnska -u dns.google --upstream-doh --listen-mode dot
                                                 # DoT listener, DoH upstream
+sudo ./build/dnska -u dns.google --upstream-transport plain
+                                                # hostname upstream without auto-DoT
 sudo ./build/dnska -u dns.google --upstream-doh --edns-padding
                                                 # DoH upstream with EDNS padding
 sudo ./build/dnska -u 8.8.8.8 --listen-doh --doh-listen-port 8053
@@ -86,6 +88,7 @@ Section: `[dns]`.  `#` and `;` comments are accepted.  See
 | `--doh-listen-port N` | DoH listener port (default `8053` when enabled) |
 | `-u ADDR` | Upstream IP or hostname (default `8.8.8.8`); hostname implies DoT, port 853 |
 | `--upstream-port N` | Override upstream port |
+| `--upstream-transport T` | Upstream transport: `plain`, `dot`, or `doh` |
 | `-t` | Force DoT upstream when using an IP-literal upstream |
 | `--upstream-doh` | DoH (RFC 8484) upstream; implies TLS, default port 443 |
 | `--doh-path PATH` | DoH URL path (default `/dns-query`) |
@@ -103,6 +106,11 @@ Section: `[dns]`.  `#` and `;` comments are accepted.  See
 | `--class C` | RR class for `-q` (default IN, only IN supported) |
 | `-v` | Debug logging |
 | `-h` | Help |
+
+`--upstream-transport` is the explicit upstream selector.  Legacy `-t` and
+`--upstream-doh` still work; conflicting combinations with
+`--upstream-transport` are rejected.  In config files, `upstream_transport`
+accepts `plain`, `dot`, or `doh`.
 
 `--listen-mode auto` preserves legacy behavior: a DoT upstream selected by
 hostname or `-t` also creates a DoT listener; DoH and plain upstreams create a
