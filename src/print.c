@@ -17,21 +17,30 @@ struct type_entry {
 };
 
 static const struct type_entry type_table[] = {
-	{ "A",      DNS_TYPE_A      },
-	{ "NS",     DNS_TYPE_NS     },
-	{ "CNAME",  DNS_TYPE_CNAME  },
-	{ "SOA",    DNS_TYPE_SOA    },
-	{ "PTR",    DNS_TYPE_PTR    },
-	{ "MX",     DNS_TYPE_MX     },
-	{ "TXT",    DNS_TYPE_TXT    },
-	{ "AAAA",   DNS_TYPE_AAAA   },
-	{ "SRV",    DNS_TYPE_SRV    },
-	{ "OPT",    DNS_TYPE_OPT    },
-	{ "DS",     DNS_TYPE_DS     },
-	{ "RRSIG",  DNS_TYPE_RRSIG  },
-	{ "NSEC",   DNS_TYPE_NSEC   },
-	{ "DNSKEY", DNS_TYPE_DNSKEY },
-	{ "CAA",    DNS_TYPE_CAA    },
+	{ "A",          DNS_TYPE_A          },
+	{ "NS",         DNS_TYPE_NS         },
+	{ "CNAME",      DNS_TYPE_CNAME      },
+	{ "SOA",        DNS_TYPE_SOA        },
+	{ "PTR",        DNS_TYPE_PTR        },
+	{ "MX",         DNS_TYPE_MX         },
+	{ "TXT",        DNS_TYPE_TXT        },
+	{ "AAAA",       DNS_TYPE_AAAA       },
+	{ "SRV",        DNS_TYPE_SRV        },
+	{ "OPT",        DNS_TYPE_OPT        },
+	{ "DS",         DNS_TYPE_DS         },
+	{ "SSHFP",      DNS_TYPE_SSHFP      },
+	{ "RRSIG",      DNS_TYPE_RRSIG      },
+	{ "NSEC",       DNS_TYPE_NSEC       },
+	{ "DNSKEY",     DNS_TYPE_DNSKEY     },
+	{ "NSEC3",      DNS_TYPE_NSEC3      },
+	{ "NSEC3PARAM", DNS_TYPE_NSEC3PARAM },
+	{ "TLSA",       DNS_TYPE_TLSA       },
+	{ "CDS",        DNS_TYPE_CDS        },
+	{ "CDNSKEY",    DNS_TYPE_CDNSKEY    },
+	{ "ZONEMD",     DNS_TYPE_ZONEMD     },
+	{ "SVCB",       DNS_TYPE_SVCB       },
+	{ "HTTPS",      DNS_TYPE_HTTPS      },
+	{ "CAA",        DNS_TYPE_CAA        },
 };
 
 int
@@ -229,6 +238,299 @@ print_hex(FILE *out, const uint8_t *rdata, size_t rdlen)
 }
 
 static void
+print_escaped_unquoted(FILE *out, const uint8_t *data, size_t len)
+{
+	for (size_t i = 0; i < len; i++) {
+		uint8_t c = data[i];
+		if (c == ',' || c == '"' || c == '\\') {
+			fputc('\\', out);
+			fputc((char)c, out);
+		} else if (c < 0x20 || c >= 0x7F) {
+			fprintf(out, "\\%03u", c);
+		} else {
+			fputc((char)c, out);
+		}
+	}
+}
+
+static void
+print_quoted_bytes(FILE *out, const uint8_t *data, size_t len)
+{
+	fputc('"', out);
+	for (size_t i = 0; i < len; i++) {
+		uint8_t c = data[i];
+		if (c == '"' || c == '\\')
+			fputc('\\', out);
+		if (c < 0x20 || c >= 0x7F)
+			fprintf(out, "\\%03u", c);
+		else
+			fputc((char)c, out);
+	}
+	fputc('"', out);
+}
+
+static const char *
+svcparam_key_str(uint16_t key, char *buf, size_t buf_len)
+{
+	switch (key) {
+	case 0:
+		return "mandatory";
+	case 1:
+		return "alpn";
+	case 2:
+		return "no-default-alpn";
+	case 3:
+		return "port";
+	case 4:
+		return "ipv4hint";
+	case 5:
+		return "ech";
+	case 6:
+		return "ipv6hint";
+	case 7:
+		return "dohpath";
+	default:
+		if (buf != NULL && buf_len > 0)
+			snprintf(buf, buf_len, "key%u", key);
+		return buf != NULL && buf_len > 0 ? buf : "key?";
+	}
+}
+
+static void
+print_svcparam_mandatory(FILE *out, const uint8_t *data, size_t len)
+{
+	if (len == 0 || (len % 2) != 0) {
+		fputs("mandatory=<bad>", out);
+		return;
+	}
+
+	fputs("mandatory=", out);
+	for (size_t pos = 0; pos < len; pos += 2) {
+		char key_buf[32];
+		if (pos > 0)
+			fputc(',', out);
+		fputs(svcparam_key_str(wire_read_u16(data + pos),
+		                       key_buf, sizeof(key_buf)),
+		      out);
+	}
+}
+
+static int
+print_svcparam_alpn(FILE *out, const uint8_t *data, size_t len)
+{
+	size_t pos   = 0;
+	int    first = 1;
+
+	while (pos < len) {
+		uint8_t alpn_len = data[pos++];
+		if (pos + alpn_len > len)
+			return -1;
+		if (!first)
+			fputc(',', out);
+		first = 0;
+		print_escaped_unquoted(out, data + pos, alpn_len);
+		pos += alpn_len;
+	}
+
+	return first ? -1 : 0;
+}
+
+static void
+print_svcparam_ipv4hint(FILE *out, const uint8_t *data, size_t len)
+{
+	if (len == 0 || (len % 4) != 0) {
+		fputs("ipv4hint=<bad>", out);
+		return;
+	}
+
+	fputs("ipv4hint=", out);
+	for (size_t pos = 0; pos < len; pos += 4) {
+		char ip[INET_ADDRSTRLEN];
+		if (pos > 0)
+			fputc(',', out);
+		if (inet_ntop(AF_INET, data + pos, ip, sizeof(ip)) == NULL)
+			fputs("<bad>", out);
+		else
+			fputs(ip, out);
+	}
+}
+
+static void
+print_svcparam_ipv6hint(FILE *out, const uint8_t *data, size_t len)
+{
+	if (len == 0 || (len % 16) != 0) {
+		fputs("ipv6hint=<bad>", out);
+		return;
+	}
+
+	fputs("ipv6hint=", out);
+	for (size_t pos = 0; pos < len; pos += 16) {
+		char ip[INET6_ADDRSTRLEN];
+		if (pos > 0)
+			fputc(',', out);
+		if (inet_ntop(AF_INET6, data + pos, ip, sizeof(ip)) == NULL)
+			fputs("<bad>", out);
+		else
+			fputs(ip, out);
+	}
+}
+
+static void
+print_svcparam(FILE *out, uint16_t key, const uint8_t *data, size_t len)
+{
+	char key_buf[32];
+
+	switch (key) {
+	case 0:
+		print_svcparam_mandatory(out, data, len);
+		break;
+	case 1:
+		fputs("alpn=", out);
+		if (print_svcparam_alpn(out, data, len) < 0)
+			fputs("<bad>", out);
+		break;
+	case 2:
+		if (len == 0)
+			fputs("no-default-alpn", out);
+		else
+			fprintf(out, "no-default-alpn=<bad len %zu>", len);
+		break;
+	case 3:
+		if (len != 2) {
+			fprintf(out, "port=<bad len %zu>", len);
+		} else {
+			fprintf(out, "port=%u", wire_read_u16(data));
+		}
+		break;
+	case 4:
+		print_svcparam_ipv4hint(out, data, len);
+		break;
+	case 5:
+		fputs("ech=", out);
+		print_hex(out, data, len);
+		break;
+	case 6:
+		print_svcparam_ipv6hint(out, data, len);
+		break;
+	case 7:
+		fputs("dohpath=", out);
+		print_quoted_bytes(out, data, len);
+		break;
+	default:
+		fputs(svcparam_key_str(key, key_buf, sizeof(key_buf)), out);
+		if (len > 0) {
+			fputc('=', out);
+			print_hex(out, data, len);
+		}
+		break;
+	}
+}
+
+static void
+print_svcb(FILE *out, const char *rr_name, const uint8_t *msg,
+           size_t msg_len, size_t rdoff, size_t rdlen)
+{
+	if (rdlen < 2) {
+		fprintf(out, "<bad %s>", rr_name);
+		return;
+	}
+
+	size_t   end          = rdoff + rdlen;
+	uint16_t svc_priority = wire_read_u16(msg + rdoff);
+	char     target[DNS_MAX_NAME_LEN + 1];
+	size_t   target_consumed = 0;
+
+	if (read_name(msg, msg_len, rdoff + 2, target, sizeof(target),
+	              &target_consumed)
+	            < 0
+	    || rdoff + 2 + target_consumed > end) {
+		fprintf(out, "<bad %s target>", rr_name);
+		return;
+	}
+
+	fprintf(out, "%u %s", svc_priority, target[0] ? target : ".");
+
+	size_t pos = rdoff + 2 + target_consumed;
+	while (pos < end) {
+		if (end - pos < 4) {
+			fprintf(out, " <bad %s param>", rr_name);
+			return;
+		}
+		uint16_t key  = wire_read_u16(msg + pos);
+		uint16_t len  = wire_read_u16(msg + pos + 2);
+		pos          += 4;
+		if (end - pos < len) {
+			fprintf(out, " <bad %s param>", rr_name);
+			return;
+		}
+		fputc(' ', out);
+		print_svcparam(out, key, msg + pos, len);
+		pos += len;
+	}
+}
+
+static void
+print_tlsa(FILE *out, const uint8_t *rdata, size_t rdlen)
+{
+	if (rdlen < 3) {
+		fputs("<bad TLSA>", out);
+		return;
+	}
+
+	fprintf(out, "usage=%u selector=%u matching=%u data=",
+	        rdata[0], rdata[1], rdata[2]);
+	print_hex(out, rdata + 3, rdlen - 3);
+}
+
+static const char *
+zonemd_scheme_name(uint8_t scheme)
+{
+	switch (scheme) {
+	case 1:
+		return "simple";
+	default:
+		return NULL;
+	}
+}
+
+static const char *
+zonemd_hash_name(uint8_t hash)
+{
+	switch (hash) {
+	case 1:
+		return "sha384";
+	case 2:
+		return "sha512";
+	default:
+		return NULL;
+	}
+}
+
+static void
+print_zonemd(FILE *out, const uint8_t *rdata, size_t rdlen)
+{
+	if (rdlen < 6) {
+		fputs("<bad ZONEMD>", out);
+		return;
+	}
+
+	uint32_t    serial = wire_read_u32(rdata);
+	uint8_t     scheme = rdata[4];
+	uint8_t     hash   = rdata[5];
+	const char *sname  = zonemd_scheme_name(scheme);
+	const char *hname  = zonemd_hash_name(hash);
+
+	fprintf(out, "serial=%u scheme=%u", serial, scheme);
+	if (sname != NULL)
+		fprintf(out, "(%s)", sname);
+	fprintf(out, " hash=%u", hash);
+	if (hname != NULL)
+		fprintf(out, "(%s)", hname);
+	fputs(" digest=", out);
+	print_hex(out, rdata + 6, rdlen - 6);
+}
+
+static void
 print_rdata(FILE *out, uint16_t type, const uint8_t *msg, size_t msg_len,
             size_t rdoff, size_t rdlen)
 {
@@ -257,6 +559,18 @@ print_rdata(FILE *out, uint16_t type, const uint8_t *msg, size_t msg_len,
 		break;
 	case DNS_TYPE_SRV:
 		print_srv(out, msg, msg_len, rdata, rdlen, rdoff);
+		break;
+	case DNS_TYPE_SVCB:
+		print_svcb(out, "SVCB", msg, msg_len, rdoff, rdlen);
+		break;
+	case DNS_TYPE_HTTPS:
+		print_svcb(out, "HTTPS", msg, msg_len, rdoff, rdlen);
+		break;
+	case DNS_TYPE_TLSA:
+		print_tlsa(out, rdata, rdlen);
+		break;
+	case DNS_TYPE_ZONEMD:
+		print_zonemd(out, rdata, rdlen);
 		break;
 	case DNS_TYPE_CAA:
 		print_caa(out, rdata, rdlen);
@@ -292,6 +606,197 @@ print_question(FILE *out, const uint8_t *msg, size_t msg_len,
 	return 0;
 }
 
+static const char *
+ede_info_code_name(uint16_t code)
+{
+	switch (code) {
+	case 0:
+		return "Other";
+	case 1:
+		return "Unsupported DNSKEY Algorithm";
+	case 2:
+		return "Unsupported DS Digest Type";
+	case 3:
+		return "Stale Answer";
+	case 4:
+		return "Forged Answer";
+	case 5:
+		return "DNSSEC Indeterminate";
+	case 6:
+		return "DNSSEC Bogus";
+	case 7:
+		return "Signature Expired";
+	case 8:
+		return "Signature Not Yet Valid";
+	case 9:
+		return "DNSKEY Missing";
+	case 10:
+		return "RRSIGs Missing";
+	case 11:
+		return "No Zone Key Bit Set";
+	case 12:
+		return "NSEC Missing";
+	case 13:
+		return "Cached Error";
+	case 14:
+		return "Not Ready";
+	case 15:
+		return "Blocked";
+	case 16:
+		return "Censored";
+	case 17:
+		return "Filtered";
+	case 18:
+		return "Prohibited";
+	case 19:
+		return "Stale NXDOMAIN Answer";
+	case 20:
+		return "Not Authoritative";
+	case 21:
+		return "Not Supported";
+	case 22:
+		return "No Reachable Authority";
+	case 23:
+		return "Network Error";
+	case 24:
+		return "Invalid Data";
+	default:
+		return NULL;
+	}
+}
+
+static void
+print_edns_ecs(FILE *out, const uint8_t *data, size_t len)
+{
+	if (len < 4) {
+		fputs("ECS <bad>", out);
+		return;
+	}
+
+	uint16_t family = wire_read_u16(data);
+	uint8_t  source = data[2];
+	uint8_t  scope  = data[3];
+
+	if (family != 1 && family != 2) {
+		fprintf(out, "ECS family=%u source=%u scope=%u address=",
+		        family, source, scope);
+		print_hex(out, data + 4, len - 4);
+		return;
+	}
+
+	uint8_t max_bits = family == 1 ? 32 : 128;
+	size_t  addr_len = ((size_t)source + 7) / 8;
+	if (source > max_bits || scope > max_bits || len != 4 + addr_len) {
+		fprintf(out, "ECS family=%u source=%u scope=%u <bad>",
+		        family, source, scope);
+		return;
+	}
+
+	uint8_t addr[16] = { 0 };
+	memcpy(addr, data + 4, addr_len);
+
+	char ip[INET6_ADDRSTRLEN];
+	int  af = family == 1 ? AF_INET : AF_INET6;
+	if (inet_ntop(af, addr, ip, sizeof(ip)) == NULL) {
+		fprintf(out, "ECS family=%u source=%u scope=%u <bad>",
+		        family, source, scope);
+		return;
+	}
+
+	fprintf(out, "ECS family=%u source=%u scope=%u address=%s",
+	        family, source, scope, ip);
+}
+
+static void
+print_edns_ede(FILE *out, const uint8_t *data, size_t len)
+{
+	if (len < 2) {
+		fputs("EDE <bad>", out);
+		return;
+	}
+
+	uint16_t    info_code = wire_read_u16(data);
+	const char *name      = ede_info_code_name(info_code);
+
+	fprintf(out, "EDE code=%u", info_code);
+	if (name != NULL)
+		fprintf(out, " (%s)", name);
+	if (len > 2) {
+		fputs(" text=", out);
+		print_quoted_bytes(out, data + 2, len - 2);
+	}
+}
+
+static void
+print_edns_option(FILE *out, uint16_t code, const uint8_t *data, size_t len)
+{
+	switch (code) {
+	case DNS_EDNS_OPTION_NSID:
+		fputs("NSID", out);
+		if (len > 0) {
+			fputs(" data=", out);
+			print_hex(out, data, len);
+		}
+		break;
+	case DNS_EDNS_OPTION_ECS:
+		print_edns_ecs(out, data, len);
+		break;
+	case DNS_EDNS_OPTION_COOKIE:
+		fputs("COOKIE", out);
+		if (len > 0) {
+			fputs(" data=", out);
+			print_hex(out, data, len);
+		}
+		break;
+	case DNS_EDNS_OPTION_PADDING:
+		fprintf(out, "Padding len=%zu", len);
+		break;
+	case DNS_EDNS_OPTION_EDE:
+		print_edns_ede(out, data, len);
+		break;
+	default:
+		fprintf(out, "OPTION%u len=%zu", code, len);
+		if (len > 0) {
+			fputs(" data=", out);
+			print_hex(out, data, len);
+		}
+		break;
+	}
+}
+
+static void
+print_opt(FILE *out, uint16_t udp_size, uint32_t ttl,
+          const uint8_t *rdata, size_t rdlen)
+{
+	uint8_t  ext_rcode = (uint8_t)(ttl >> 24);
+	uint8_t  version   = (uint8_t)((ttl >> 16) & 0xFF);
+	uint16_t flags     = (uint16_t)(ttl & 0xFFFF);
+
+	fprintf(out, ";; OPT udp_size=%u ext_rcode=%u version=%u flags=0x%04x\n",
+	        udp_size, ext_rcode, version, flags);
+
+	size_t pos = 0;
+	while (pos < rdlen) {
+		if (rdlen - pos < 4) {
+			fputs(";; EDNS option <bad>\n", out);
+			return;
+		}
+
+		uint16_t code     = wire_read_u16(rdata + pos);
+		uint16_t opt_len  = wire_read_u16(rdata + pos + 2);
+		pos              += 4;
+		if (rdlen - pos < opt_len) {
+			fputs(";; EDNS option <bad>\n", out);
+			return;
+		}
+
+		fputs(";; EDNS option ", out);
+		print_edns_option(out, code, rdata + pos, opt_len);
+		fputc('\n', out);
+		pos += opt_len;
+	}
+}
+
 static int
 print_rr(FILE *out, const uint8_t *msg, size_t msg_len, size_t off,
          size_t *next_off)
@@ -316,8 +821,7 @@ print_rr(FILE *out, const uint8_t *msg, size_t msg_len, size_t off,
 		return -1;
 
 	if (type == DNS_TYPE_OPT) {
-		fprintf(out, ";; OPT udp_size=%u flags=0x%04x\n",
-		        rrclass, (unsigned)(ttl & 0xFFFF));
+		print_opt(out, rrclass, ttl, msg + rdoff, rdlen);
 	} else {
 		fprintf(out, "%s.\t%u\t%s\t%s\t",
 		        name[0] ? name : "",

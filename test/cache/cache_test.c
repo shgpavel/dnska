@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "cache.h"
 #include "test.h"
@@ -114,11 +115,11 @@ make_a_response_two_ttl(uint8_t *buf, uint16_t id, const char *qname,
 	pos        = append_name(buf, pos, qname);
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
-	pos += 4;
+	pos        += 4;
 
 	/* First RR */
-	buf[pos++] = 0xC0;
-	buf[pos++] = DNS_HEADER_SIZE;
+	buf[pos++]  = 0xC0;
+	buf[pos++]  = DNS_HEADER_SIZE;
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	write_u32(buf + pos + 4, ttl1);
@@ -130,8 +131,8 @@ make_a_response_two_ttl(uint8_t *buf, uint16_t id, const char *qname,
 	buf[pos++]  = 4;
 
 	/* Second RR */
-	buf[pos++] = 0xC0;
-	buf[pos++] = DNS_HEADER_SIZE;
+	buf[pos++]  = 0xC0;
+	buf[pos++]  = DNS_HEADER_SIZE;
 	write_u16(buf + pos, DNS_TYPE_A);
 	write_u16(buf + pos + 2, DNS_CLASS_IN);
 	write_u32(buf + pos + 4, ttl2);
@@ -213,6 +214,20 @@ first_rr_ttl(const uint8_t *buf, size_t len)
 	pos += (size_t)n;
 	assert(pos + 8 <= len);
 	return wire_read_u32(buf + pos + 4);
+}
+
+static void
+age_cache_entry(struct cache *cache, const char *name, uint32_t seconds)
+{
+	pthread_rwlock_wrlock(&cache->lock);
+	for (int i = 0; i < CACHE_SLOTS; i++) {
+		if (cache->entries[i].in_use
+		    && strcmp(cache->entries[i].name, name) == 0) {
+			cache->entries[i].inserted_at.tv_sec -= (time_t)seconds;
+			break;
+		}
+	}
+	pthread_rwlock_unlock(&cache->lock);
 }
 
 /* --- negative TTL handling --- */
@@ -634,6 +649,163 @@ test_min_ttl_used_from_multi_rr_response(void)
 	cache_destroy(&cache);
 }
 
+/* --- serve-stale handling --- */
+
+static void
+test_fresh_lookup_not_stale(void)
+{
+	struct cache               cache;
+	struct dns_query_cache_key key = { 0 };
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     response_len;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	response_len = make_a_response(response, 0x1111, DNS_RCODE_OK,
+	                               "fresh.example", 120);
+	query_len    = make_query(query, 0x2222, "fresh.example",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	cache_insert(&cache, "fresh.example", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key, response, response_len, 0);
+	assert(cache_lookup(&cache, "fresh.example", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key, 0x3333,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 1);
+	assert(first_rr_ttl(out, out_len) == 120);
+	assert(cache_lookup_stale(&cache, "fresh.example", DNS_TYPE_A,
+	                          DNS_CLASS_IN, &key, 0x4444,
+	                          query + DNS_HEADER_SIZE,
+	                          query_len - DNS_HEADER_SIZE,
+	                          out, sizeof(out), &out_len)
+	       == 0);
+
+	cache_destroy(&cache);
+}
+
+static void
+test_stale_lookup_within_window(void)
+{
+	struct cache               cache;
+	struct dns_query_cache_key key = { 0 };
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     response_len;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	response_len = make_a_response(response, 0x1111, DNS_RCODE_OK,
+	                               "stale.example", 1);
+	query_len    = make_query(query, 0x2222, "stale.example",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	cache_insert(&cache, "stale.example", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key, response, response_len, 0);
+	age_cache_entry(&cache, "stale.example", 2);
+
+	assert(cache_lookup(&cache, "stale.example", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key, 0x3333,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == -2);
+	assert(cache_lookup_stale(&cache, "stale.example", DNS_TYPE_A,
+	                          DNS_CLASS_IN, &key, 0x4444,
+	                          query + DNS_HEADER_SIZE,
+	                          query_len - DNS_HEADER_SIZE,
+	                          out, sizeof(out), &out_len)
+	       == 1);
+	assert(wire_read_u16(out) == 0x4444);
+	assert(first_rr_ttl(out, out_len) == CACHE_STALE_ANSWER_TTL);
+
+	cache_destroy(&cache);
+}
+
+static void
+test_stale_lookup_after_window_expires(void)
+{
+	struct cache               cache;
+	struct dns_query_cache_key key = { 0 };
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     response_len;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	response_len = make_a_response(response, 0x1111, DNS_RCODE_OK,
+	                               "old.example", 1);
+	query_len    = make_query(query, 0x2222, "old.example",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	cache_insert(&cache, "old.example", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key, response, response_len, 0);
+	age_cache_entry(&cache, "old.example", CACHE_STALE_WINDOW_SEC + 2);
+
+	assert(cache_lookup_stale(&cache, "old.example", DNS_TYPE_A,
+	                          DNS_CLASS_IN, &key, 0x3333,
+	                          query + DNS_HEADER_SIZE,
+	                          query_len - DNS_HEADER_SIZE,
+	                          out, sizeof(out), &out_len)
+	       == 0);
+	assert(cache_lookup(&cache, "old.example", DNS_TYPE_A, DNS_CLASS_IN,
+	                    &key, 0x4444,
+	                    query + DNS_HEADER_SIZE, query_len - DNS_HEADER_SIZE,
+	                    out, sizeof(out), &out_len)
+	       == 0);
+
+	cache_destroy(&cache);
+}
+
+static void
+test_stale_lookup_requires_matching_query_key(void)
+{
+	struct cache               cache;
+	struct dns_query_cache_key key_cd    = { .flags = DNS_FLAG_CD | DNS_FLAG_RD };
+	struct dns_query_cache_key key_no_cd = { .flags = DNS_FLAG_RD };
+	uint8_t                    response[DNS_MAX_MSG_SIZE];
+	uint8_t                    query[DNS_MAX_MSG_SIZE];
+	uint8_t                    out[DNS_MAX_MSG_SIZE];
+	size_t                     response_len;
+	size_t                     query_len;
+	size_t                     out_len = 0;
+
+	assert(cache_init(&cache) == 0);
+
+	response_len = make_a_response(response, 0x1111, DNS_RCODE_OK,
+	                               "keyed.example", 1);
+	query_len    = make_query(query, 0x2222, "keyed.example",
+	                          DNS_TYPE_A, DNS_CLASS_IN);
+
+	cache_insert(&cache, "keyed.example", DNS_TYPE_A, DNS_CLASS_IN,
+	             &key_cd, response, response_len, 0);
+	age_cache_entry(&cache, "keyed.example", 2);
+
+	assert(cache_lookup_stale(&cache, "keyed.example", DNS_TYPE_A,
+	                          DNS_CLASS_IN, &key_no_cd, 0x3333,
+	                          query + DNS_HEADER_SIZE,
+	                          query_len - DNS_HEADER_SIZE,
+	                          out, sizeof(out), &out_len)
+	       == 0);
+	assert(cache_lookup_stale(&cache, "keyed.example", DNS_TYPE_A,
+	                          DNS_CLASS_IN, &key_cd, 0x4444,
+	                          query + DNS_HEADER_SIZE,
+	                          query_len - DNS_HEADER_SIZE,
+	                          out, sizeof(out), &out_len)
+	       == 1);
+
+	cache_destroy(&cache);
+}
+
 int
 main(void)
 {
@@ -651,6 +823,10 @@ main(void)
 	test_cd_flag_differentiates_cache_entries();
 	test_overwrite_same_key();
 	test_min_ttl_used_from_multi_rr_response();
+	test_fresh_lookup_not_stale();
+	test_stale_lookup_within_window();
+	test_stale_lookup_after_window_expires();
+	test_stale_lookup_requires_matching_query_key();
 
 	puts("cache tests passed");
 	return 0;

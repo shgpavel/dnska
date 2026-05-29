@@ -832,6 +832,33 @@ test_string_fallbacks(void)
 	assert(strcmp(dns_type_str(DNS_TYPE_SOA, type_buf, sizeof(type_buf)),
 	              "SOA")
 	       == 0);
+	assert(strcmp(dns_type_str(DNS_TYPE_SSHFP, type_buf, sizeof(type_buf)),
+	              "SSHFP")
+	       == 0);
+	assert(strcmp(dns_type_str(DNS_TYPE_NSEC3, type_buf, sizeof(type_buf)),
+	              "NSEC3")
+	       == 0);
+	assert(strcmp(dns_type_str(DNS_TYPE_NSEC3PARAM, type_buf, sizeof(type_buf)),
+	              "NSEC3PARAM")
+	       == 0);
+	assert(strcmp(dns_type_str(DNS_TYPE_TLSA, type_buf, sizeof(type_buf)),
+	              "TLSA")
+	       == 0);
+	assert(strcmp(dns_type_str(DNS_TYPE_CDS, type_buf, sizeof(type_buf)),
+	              "CDS")
+	       == 0);
+	assert(strcmp(dns_type_str(DNS_TYPE_CDNSKEY, type_buf, sizeof(type_buf)),
+	              "CDNSKEY")
+	       == 0);
+	assert(strcmp(dns_type_str(DNS_TYPE_ZONEMD, type_buf, sizeof(type_buf)),
+	              "ZONEMD")
+	       == 0);
+	assert(strcmp(dns_type_str(DNS_TYPE_SVCB, type_buf, sizeof(type_buf)),
+	              "SVCB")
+	       == 0);
+	assert(strcmp(dns_type_str(DNS_TYPE_HTTPS, type_buf, sizeof(type_buf)),
+	              "HTTPS")
+	       == 0);
 	assert(strcmp(dns_type_str(65000, type_buf, sizeof(type_buf)),
 	              "TYPE65000")
 	       == 0);

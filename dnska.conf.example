@@ -31,6 +31,18 @@
 ; Override DoH URL path.
 ;doh_path = /dns-query
 
+; Pad outbound DNS messages for encrypted upstream transports (DoT/DoH).
+; The default block size follows the conservative 128-byte policy from
+; RFC 8467; values above 512 are rejected.
+;edns_padding = false
+;edns_padding_block = 128
+
+; Opt in to resolver SVCB discovery for a named upstream.  This queries
+; _dns.<resolver-name> for alpn/port/dohpath metadata and keeps the
+; configured upstream if discovery fails or returns unsupported metadata.
+;resolver_discovery = false
+;resolver_discovery_name = dns.google
+
 ; --- Listener TLS (DoT server) ---
 ; Both must be set together; otherwise an ephemeral self-signed cert
 ; is generated.  The key file must be mode 0600.

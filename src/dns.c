@@ -431,12 +431,30 @@ dns_type_str(uint16_t type, char *buf, size_t buf_len)
 		return "OPT";
 	case DNS_TYPE_DS:
 		return "DS";
+	case DNS_TYPE_SSHFP:
+		return "SSHFP";
 	case DNS_TYPE_RRSIG:
 		return "RRSIG";
 	case DNS_TYPE_NSEC:
 		return "NSEC";
 	case DNS_TYPE_DNSKEY:
 		return "DNSKEY";
+	case DNS_TYPE_NSEC3:
+		return "NSEC3";
+	case DNS_TYPE_NSEC3PARAM:
+		return "NSEC3PARAM";
+	case DNS_TYPE_TLSA:
+		return "TLSA";
+	case DNS_TYPE_CDS:
+		return "CDS";
+	case DNS_TYPE_CDNSKEY:
+		return "CDNSKEY";
+	case DNS_TYPE_ZONEMD:
+		return "ZONEMD";
+	case DNS_TYPE_SVCB:
+		return "SVCB";
+	case DNS_TYPE_HTTPS:
+		return "HTTPS";
 	case DNS_TYPE_CAA:
 		return "CAA";
 	default:

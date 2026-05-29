@@ -35,6 +35,15 @@ strip_comment(char *s)
 	}
 }
 
+static bool
+parse_bool(const char *value)
+{
+	return strcmp(value, "1") == 0
+	       || strcmp(value, "yes") == 0
+	       || strcmp(value, "true") == 0
+	       || strcmp(value, "on") == 0;
+}
+
 int
 config_parse_port_u16(const char *value, uint16_t *out)
 {
@@ -48,6 +57,20 @@ config_parse_port_u16(const char *value, uint16_t *out)
 		return -1;
 
 	*out = (uint16_t)port;
+	return 0;
+}
+
+int
+config_parse_edns_padding_block(const char *value, uint16_t *out)
+{
+	uint16_t block;
+
+	if (config_parse_port_u16(value, &block) < 0)
+		return -1;
+	if (block > DNS_EDNS_PADDING_MAX_BLOCK)
+		return -1;
+
+	*out = block;
 	return 0;
 }
 
@@ -87,6 +110,8 @@ config_apply_transport_defaults(struct dns_config *cfg, bool upstream_is_hostnam
 {
 	if (upstream_is_hostname)
 		cfg->upstream_tls = true;
+	if (cfg->edns_padding && cfg->edns_padding_block == 0)
+		cfg->edns_padding_block = DNS_EDNS_PADDING_DEFAULT_BLOCK;
 
 	if (cfg->upstream_doh) {
 		cfg->upstream_tls = true;
@@ -204,17 +229,36 @@ config_load(const char *path, struct dns_config *cfg)
 			}
 		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "upstream_tls") == 0) {
-			cfg->upstream_tls = (strcmp(val, "1") == 0
-			                     || strcmp(val, "yes") == 0
-			                     || strcmp(val, "true") == 0);
+			cfg->upstream_tls = parse_bool(val);
 		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "upstream_doh") == 0) {
-			cfg->upstream_doh = (strcmp(val, "1") == 0
-			                     || strcmp(val, "yes") == 0
-			                     || strcmp(val, "true") == 0);
+			cfg->upstream_doh = parse_bool(val);
 		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "doh_path") == 0) {
 			snprintf(cfg->doh_path, sizeof(cfg->doh_path), "%s", val);
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "edns_padding") == 0) {
+			cfg->edns_padding = parse_bool(val);
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "edns_padding_block") == 0) {
+			uint16_t block;
+
+			if (config_parse_edns_padding_block(val, &block) < 0) {
+				fprintf(stderr,
+				        "config: invalid EDNS padding block: %s\n",
+				        val);
+				fclose(f);
+				return -1;
+			}
+			cfg->edns_padding_block = block;
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "resolver_discovery") == 0) {
+			cfg->resolver_discovery = parse_bool(val);
+		} else if (strcmp(section, "dns") == 0
+		           && strcmp(key, "resolver_discovery_name") == 0) {
+			snprintf(cfg->resolver_discovery_name,
+			         sizeof(cfg->resolver_discovery_name),
+			         "%s", val);
 		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "tls_cert") == 0) {
 			snprintf(cfg->tls_cert, sizeof(cfg->tls_cert), "%s", val);
@@ -231,9 +275,7 @@ config_load(const char *path, struct dns_config *cfg)
 			         "%s", val);
 		} else if (strcmp(section, "dns") == 0
 		           && strcmp(key, "tls_insecure") == 0) {
-			cfg->tls_insecure = (strcmp(val, "1") == 0
-			                     || strcmp(val, "yes") == 0
-			                     || strcmp(val, "true") == 0);
+			cfg->tls_insecure = parse_bool(val);
 		} else {
 			fprintf(stderr,
 			        "config: warning: unrecognized key '%s' in section '[%s]'\n",

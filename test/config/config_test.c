@@ -12,9 +12,10 @@ static void
 init_config(struct dns_config *cfg)
 {
 	memset(cfg, 0, sizeof(*cfg));
-	cfg->listen_port   = 53;
-	cfg->listen_mode   = DNS_LISTEN_AUTO;
-	cfg->upstream_port = 53;
+	cfg->listen_port        = 53;
+	cfg->listen_mode        = DNS_LISTEN_AUTO;
+	cfg->upstream_port      = 53;
+	cfg->edns_padding_block = DNS_EDNS_PADDING_DEFAULT_BLOCK;
 }
 
 static void
@@ -149,6 +150,51 @@ test_explicit_ports_survive_hostname_defaults(void)
 	TEST_EXPECT_INT_EQ(cfg.upstream_port, 5353);
 }
 
+static void
+test_edns_padding_and_discovery_config(void)
+{
+	struct dns_config cfg;
+	init_config(&cfg);
+
+	load_config_text("[dns]\n"
+	                 "edns_padding = true\n"
+	                 "edns_padding_block = 256\n"
+	                 "resolver_discovery = true\n"
+	                 "resolver_discovery_name = dns.example\n",
+	                 &cfg);
+
+	TEST_CHECK(cfg.edns_padding);
+	TEST_EXPECT_INT_EQ(cfg.edns_padding_block, 256);
+	TEST_CHECK(cfg.resolver_discovery);
+	TEST_EXPECT_STR_EQ(cfg.resolver_discovery_name, "dns.example");
+}
+
+static void
+test_edns_padding_default_block(void)
+{
+	struct dns_config cfg;
+	init_config(&cfg);
+	cfg.edns_padding_block = 0;
+	cfg.edns_padding       = true;
+
+	config_apply_transport_defaults(&cfg, false);
+
+	TEST_EXPECT_INT_EQ(cfg.edns_padding_block,
+	                   DNS_EDNS_PADDING_DEFAULT_BLOCK);
+}
+
+static void
+test_invalid_edns_padding_block_rejected(void)
+{
+	struct dns_config cfg;
+	init_config(&cfg);
+
+	TEST_CHECK(try_load_config_text("[dns]\n"
+	                                "edns_padding_block = 1024\n",
+	                                &cfg)
+	           < 0);
+}
+
 int
 main(void)
 {
@@ -158,6 +204,9 @@ main(void)
 	test_transport_defaults_plain_listener_dot_upstream();
 	test_transport_defaults_dot_listener_doh_upstream();
 	test_explicit_ports_survive_hostname_defaults();
+	test_edns_padding_and_discovery_config();
+	test_edns_padding_default_block();
+	test_invalid_edns_padding_block_rejected();
 
 	puts("config tests passed");
 	return 0;

@@ -20,6 +20,18 @@ void
 resolver_set_tls_config(const char *ca_file, const char *auth_name,
                         bool insecure);
 
+struct resolver_discovery_result {
+	bool     found;
+	bool     supports_dot;
+	bool     supports_doh;
+	bool     supports_doq;
+	bool     supports_odoh;
+	uint16_t priority;
+	uint16_t port;
+	char     target_name[256];
+	char     doh_path[128];
+};
+
 /*
  * Try each address in upstream_addrs in order until one succeeds.
  * upstream_addrs is an array of NUL-terminated IP literals.  Returns 0
@@ -29,6 +41,10 @@ resolver_set_tls_config(const char *ca_file, const char *auth_name,
  * (defaults to /dns-query when NULL or empty).  When upstream_doh is
  * true, upstream_tls is implied.  Otherwise upstream_tls selects DoT
  * (RFC 7858); plain UDP/TCP is used when both are false.
+ *
+ * edns_padding_block enables EDNS(0) padding for encrypted upstream
+ * transports (DoT/DoH) when non-zero.  Plain DNS forwarding is never
+ * padded by this option.
  */
 int
 resolver_forward(const char upstream_addrs[][INET6_ADDRSTRLEN],
@@ -36,8 +52,24 @@ resolver_forward(const char upstream_addrs[][INET6_ADDRSTRLEN],
                  uint16_t upstream_port, bool upstream_tls,
                  bool upstream_doh, const char *doh_path,
                  const char    *upstream_hostname,
+                 uint16_t       edns_padding_block,
                  const uint8_t *query, size_t query_len,
                  uint8_t *response, size_t response_size,
                  size_t *response_len);
+
+/*
+ * Query _dns.<resolver_name> SVCB metadata using the already configured
+ * bootstrap upstream.  The result is advisory: callers should keep their
+ * previous transport as fallback if no supported metadata is found.
+ */
+int
+resolver_discover_svcb(const char upstream_addrs[][INET6_ADDRSTRLEN],
+                       size_t     upstream_addr_count,
+                       uint16_t upstream_port, bool upstream_tls,
+                       bool upstream_doh, const char *doh_path,
+                       const char                       *upstream_hostname,
+                       uint16_t                          edns_padding_block,
+                       const char                       *resolver_name,
+                       struct resolver_discovery_result *result);
 
 #endif /* DNSKA_RESOLVER_H */

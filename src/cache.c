@@ -39,6 +39,12 @@ elapsed_since(const struct timespec *start, const struct timespec *end)
 	return (uint32_t)sec;
 }
 
+static bool
+stale_window_expired(uint32_t elapsed, uint32_t ttl)
+{
+	return elapsed >= ttl && elapsed - ttl > CACHE_STALE_WINDOW_SEC;
+}
+
 static uint32_t
 hash_key(const struct cache *c, const char *name, uint16_t qtype, uint16_t qclass,
          const struct dns_query_cache_key *query_key)
@@ -223,6 +229,18 @@ rrs_min_ttl(const uint8_t *buf, size_t buf_len)
 	return min == UINT32_MAX ? 0 : min;
 }
 
+static bool
+stale_answer_eligible(const struct cache_entry *e)
+{
+	uint16_t rcode;
+
+	if (e->response_len < 4)
+		return false;
+
+	rcode = e->response[3] & DNS_FLAGS_RCODE_MASK;
+	return rcode == DNS_RCODE_OK || rcode == DNS_RCODE_NXDOMAIN;
+}
+
 static void
 patch_ttls(uint8_t *buf, size_t buf_len, uint32_t elapsed, uint32_t ttl_cap)
 {
@@ -254,6 +272,32 @@ patch_ttls(uint8_t *buf, size_t buf_len, uint32_t elapsed, uint32_t ttl_cap)
 
 			wire_write_u32(buf + pos + 4, ttl);
 		}
+
+		pos += 10 + wire_read_u16(buf + pos + 8);
+		if (pos > buf_len)
+			return;
+	}
+}
+
+static void
+set_ttls(uint8_t *buf, size_t buf_len, uint32_t ttl)
+{
+	uint32_t rrs;
+	size_t   pos = wire_rr_start(buf, buf_len, &rrs);
+
+	if (pos == SIZE_MAX)
+		return;
+
+	for (uint32_t i = 0; i < rrs; i++) {
+		int n = wire_skip_name(buf, buf_len, pos);
+		if (n < 0)
+			return;
+		pos += (size_t)n;
+		if (pos + 10 > buf_len)
+			return;
+
+		if (wire_read_u16(buf + pos) != DNS_TYPE_OPT)
+			wire_write_u32(buf + pos + 4, ttl);
 
 		pos += 10 + wire_read_u16(buf + pos + 8);
 		if (pos > buf_len)
@@ -545,7 +589,8 @@ cache_lookup(struct cache *c, const char *name, uint16_t qtype, uint16_t qclass,
 
 	elapsed = elapsed_since(&e->inserted_at, &now);
 	if (elapsed >= e->min_ttl) {
-		evict_expired_entry(c, bucket, idx);
+		if (stale_window_expired(elapsed, e->min_ttl))
+			evict_expired_entry(c, bucket, idx);
 		pthread_rwlock_unlock(&c->lock);
 		return -2;
 	}
@@ -565,6 +610,61 @@ cache_lookup(struct cache *c, const char *name, uint16_t qtype, uint16_t qclass,
 		return build_rc;
 
 	patch_ttls(buf, *len, elapsed, ttl_cap);
+	return 1;
+}
+
+int
+cache_lookup_stale(struct cache *c, const char *name, uint16_t qtype,
+                   uint16_t                          qclass,
+                   const struct dns_query_cache_key *query_key, uint16_t id,
+                   const uint8_t *question, size_t question_len,
+                   uint8_t *buf, size_t buf_size, size_t *len)
+{
+	int                bucket = (int)(hash_key(c, name, qtype, qclass, query_key) % CACHE_BUCKETS);
+	struct cache_entry snapshot;
+	int                build_rc;
+	struct timespec    now;
+	uint32_t           ttl_cap = 0;
+	uint32_t           elapsed;
+	int                idx;
+
+	pthread_rwlock_wrlock(&c->lock);
+
+	idx = find_entry_idx(c, bucket, name, qtype, qclass, query_key);
+	if (idx == CACHE_NONE) {
+		pthread_rwlock_unlock(&c->lock);
+		return 0;
+	}
+
+	struct cache_entry *e = &c->entries[idx];
+	if (!monotonic_now(&now)) {
+		pthread_rwlock_unlock(&c->lock);
+		return 0;
+	}
+
+	elapsed = elapsed_since(&e->inserted_at, &now);
+	if (elapsed < e->min_ttl) {
+		pthread_rwlock_unlock(&c->lock);
+		return 0;
+	}
+	if (stale_window_expired(elapsed, e->min_ttl)
+	    || !stale_answer_eligible(e)
+	    || e->response_len < DNS_HEADER_SIZE + e->question_wire_len) {
+		evict_expired_entry(c, bucket, idx);
+		pthread_rwlock_unlock(&c->lock);
+		return 0;
+	}
+
+	lru_touch(c, idx);
+	snapshot = *e;
+	pthread_rwlock_unlock(&c->lock);
+
+	build_rc = build_cached_response(&snapshot, id, question, question_len,
+	                                 buf, buf_size, len, &ttl_cap);
+	if (build_rc != 1)
+		return build_rc;
+
+	set_ttls(buf, *len, CACHE_STALE_ANSWER_TTL);
 	return 1;
 }
 

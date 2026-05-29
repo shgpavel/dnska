@@ -38,6 +38,7 @@
 
 # Build output
 build/
+build-codex/
 compile_commands.json
 
 # Local agent state

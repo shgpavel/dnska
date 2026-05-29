@@ -23,25 +23,29 @@
 static volatile sig_atomic_t *g_running;
 
 static struct option          long_options[] = {
-	{ "config",        required_argument, NULL, 'c' },
-	{ "port",          required_argument, NULL, 'p' },
-	{ "listen-mode",   required_argument, NULL, 'M' }, /* long only */
-	{ "upstream",      required_argument, NULL, 'u' },
-	{ "upstream-port", required_argument, NULL, 'P' }, /* long only */
-	{ "upstream-tls",  no_argument,       NULL, 't' },
-	{ "tls-cert",      required_argument, NULL, 'C' }, /* long only */
-	{ "tls-key",       required_argument, NULL, 'k' },
-	{ "tls-ca",        required_argument, NULL, 'A' }, /* long only */
-	{ "tls-auth-name", required_argument, NULL, 'N' }, /* long only */
-	{ "insecure",      no_argument,       NULL, 'I' }, /* long only */
-	{ "upstream-doh",  no_argument,       NULL, 'D' }, /* long only */
-	{ "doh-path",      required_argument, NULL, 'X' }, /* long only */
-	{ "query",         required_argument, NULL, 'q' },
-	{ "type",          required_argument, NULL, 'T' }, /* long only */
-	{ "class",         required_argument, NULL, 'L' }, /* long only */
-	{ "verbose",       no_argument,       NULL, 'v' },
-	{ "help",          no_argument,       NULL, 'h' },
-	{ NULL,            0,                 NULL, 0   },
+	{ "config",                  required_argument, NULL, 'c' },
+	{ "port",	            required_argument, NULL, 'p' },
+	{ "listen-mode",             required_argument, NULL, 'M' }, /* long only */
+	{ "upstream",                required_argument, NULL, 'u' },
+	{ "upstream-port",           required_argument, NULL, 'P' }, /* long only */
+	{ "upstream-tls",            no_argument,       NULL, 't' },
+	{ "tls-cert",                required_argument, NULL, 'C' }, /* long only */
+	{ "tls-key",                 required_argument, NULL, 'k' },
+	{ "tls-ca",                  required_argument, NULL, 'A' }, /* long only */
+	{ "tls-auth-name",           required_argument, NULL, 'N' }, /* long only */
+	{ "insecure",                no_argument,       NULL, 'I' }, /* long only */
+	{ "upstream-doh",            no_argument,       NULL, 'D' }, /* long only */
+	{ "doh-path",                required_argument, NULL, 'X' }, /* long only */
+	{ "edns-padding",            no_argument,       NULL, 'E' }, /* long only */
+	{ "edns-padding-block",      required_argument, NULL, 'B' }, /* long only */
+	{ "resolver-discovery",      no_argument,       NULL, 'R' }, /* long only */
+	{ "resolver-discovery-name", required_argument, NULL, 'Y' }, /* long only */
+	{ "query",	           required_argument, NULL, 'q' },
+	{ "type",	            required_argument, NULL, 'T' }, /* long only */
+	{ "class",	           required_argument, NULL, 'L' }, /* long only */
+	{ "verbose",                 no_argument,       NULL, 'v' },
+	{ "help",	            no_argument,       NULL, 'h' },
+	{ NULL,	              0,                 NULL, 0   },
 };
 
 static void
@@ -82,6 +86,18 @@ usage(const char *prog)
 	                "implies TLS, default port 443\n");
 	fprintf(stderr, "      --doh-path PATH    "
 	                "DoH URL path (default /dns-query)\n");
+	fprintf(stderr, "      --edns-padding    "
+	                "Pad encrypted upstream DNS messages with EDNS(0)\n");
+	fprintf(stderr, "      --edns-padding-block N\n"
+	                "                         "
+	                "Padding block size (default 128, max 512)\n");
+	fprintf(stderr, "      --resolver-discovery\n"
+	                "                         "
+	                "Query _dns.<name> SVCB metadata for the upstream\n");
+	fprintf(stderr, "      --resolver-discovery-name NAME\n"
+	                "                         "
+	                "Resolver name for SVCB discovery (default: upstream "
+	                "name)\n");
 	fprintf(stderr, "  -q, --query NAME       "
 	                "Client mode: look up NAME against the upstream\n"
 	                "                         "
@@ -178,6 +194,119 @@ build_query_wire(uint8_t *buf, size_t buf_size, uint16_t id, const char *qname,
 	return pos;
 }
 
+static uint16_t
+configured_edns_padding_block(const struct dns_config *cfg)
+{
+	return cfg->edns_padding ? cfg->edns_padding_block : 0;
+}
+
+static const char *
+configured_discovery_name(const struct dns_config *cfg)
+{
+	if (cfg->resolver_discovery_name[0] != '\0')
+		return cfg->resolver_discovery_name;
+	if (cfg->upstream_hostname[0] != '\0')
+		return cfg->upstream_hostname;
+	if (cfg->tls_auth_name[0] != '\0')
+		return cfg->tls_auth_name;
+	return NULL;
+}
+
+static bool
+is_resolver_arpa_name(const char *name)
+{
+	if (name == NULL)
+		return false;
+
+	return strcasecmp(name, "resolver.arpa") == 0
+	       || strcasecmp(name, "_dns.resolver.arpa") == 0;
+}
+
+static void
+apply_discovery_result(struct dns_config *cfg, const char *discovery_name,
+                       const struct resolver_discovery_result *result)
+{
+	if (!result->found)
+		return;
+
+	if (cfg->upstream_hostname[0] == '\0'
+	    && cfg->tls_auth_name[0] == '\0'
+	    && discovery_name != NULL
+	    && !is_resolver_arpa_name(discovery_name)) {
+		snprintf(cfg->upstream_hostname, sizeof(cfg->upstream_hostname),
+		         "%s", discovery_name);
+	}
+
+	if (cfg->upstream_doh && result->supports_doh) {
+		cfg->upstream_tls = true;
+		if (result->doh_path[0] != '\0')
+			snprintf(cfg->doh_path, sizeof(cfg->doh_path), "%s",
+			         result->doh_path);
+		if (!cfg->upstream_port_explicit)
+			cfg->upstream_port = result->port != 0 ?
+			                             result->port :
+			                             443;
+		return;
+	}
+
+	if (!cfg->upstream_doh && result->supports_dot) {
+		cfg->upstream_tls = true;
+		if (!cfg->upstream_port_explicit)
+			cfg->upstream_port = result->port != 0 ?
+			                             result->port :
+			                             853;
+		if (!cfg->listen_port_explicit) {
+			enum dns_listen_mode mode = config_effective_listen_mode(cfg);
+			cfg->listen_port          = mode == DNS_LISTEN_DOT ? 853 : 53;
+		}
+	}
+}
+
+static void
+discover_resolver_metadata(struct dns_config *cfg)
+{
+	const char *name = configured_discovery_name(cfg);
+
+	if (name == NULL) {
+		log_msg(LOG_WARN,
+		        "resolver: discovery requested but no resolver name is "
+		        "configured\n");
+		return;
+	}
+
+	struct resolver_discovery_result result;
+	int                              rc = resolver_discover_svcb(
+	        cfg->upstream_addrs, cfg->upstream_addr_count,
+	        cfg->upstream_port, cfg->upstream_tls, cfg->upstream_doh,
+	        cfg->doh_path, cfg->upstream_hostname,
+	        configured_edns_padding_block(cfg), name, &result);
+	if (rc < 0) {
+		log_msg(LOG_WARN,
+		        "resolver: SVCB discovery for %s failed; keeping "
+		        "configured upstream\n",
+		        name);
+		return;
+	}
+	if (!result.found) {
+		log_msg(LOG_INFO,
+		        "resolver: no usable SVCB metadata for %s\n", name);
+		return;
+	}
+
+	log_msg(LOG_INFO,
+	        "resolver: discovered SVCB target=%s alpn=%s%s%s%s "
+	        "port=%u doh_path=%s\n",
+	        result.target_name[0] != '\0' ? result.target_name : ".",
+	        result.supports_dot ? "dot" : "",
+	        result.supports_doh ? " doh" : "",
+	        result.supports_doq ? " doq" : "",
+	        result.supports_odoh ? " odoh" : "",
+	        result.port,
+	        result.doh_path[0] != '\0' ? result.doh_path : "-");
+
+	apply_discovery_result(cfg, name, &result);
+}
+
 static int
 run_client_mode(struct dns_config *cfg, const char *qname, uint16_t qtype,
                 uint16_t qclass)
@@ -207,7 +336,9 @@ run_client_mode(struct dns_config *cfg, const char *qname, uint16_t qtype,
 	                                       cfg->upstream_port,
 	                                       cfg->upstream_tls,
 	                                       cfg->upstream_doh, cfg->doh_path,
-	                                       cfg->upstream_hostname, query,
+	                                       cfg->upstream_hostname,
+	                                       configured_edns_padding_block(cfg),
+	                                       query,
 	                                       query_len, response,
 	                                       sizeof(response), &response_len);
 	if (rc < 0) {
@@ -237,7 +368,8 @@ main(int argc, char **argv)
 	cfg.listen_port = 53;
 	cfg.listen_mode = DNS_LISTEN_AUTO;
 	snprintf(cfg.upstream_addr, sizeof(cfg.upstream_addr), "8.8.8.8");
-	cfg.upstream_port = 53;
+	cfg.upstream_port      = 53;
+	cfg.edns_padding_block = DNS_EDNS_PADDING_DEFAULT_BLOCK;
 
 	const char *config_path;
 	bool        config_explicit;
@@ -324,6 +456,28 @@ main(int argc, char **argv)
 		case 'X':
 			snprintf(cfg.doh_path, sizeof(cfg.doh_path), "%s",
 			         optarg);
+			break;
+		case 'E':
+			cfg.edns_padding = true;
+			break;
+		case 'B': {
+			uint16_t block;
+			if (config_parse_edns_padding_block(optarg, &block) < 0) {
+				fprintf(stderr,
+				        "error: invalid EDNS padding block: %s\n",
+				        optarg);
+				return 1;
+			}
+			cfg.edns_padding_block = block;
+			break;
+		}
+		case 'R':
+			cfg.resolver_discovery = true;
+			break;
+		case 'Y':
+			snprintf(cfg.resolver_discovery_name,
+			         sizeof(cfg.resolver_discovery_name),
+			         "%s", optarg);
 			break;
 		case 'q':
 			query_name = optarg;
@@ -424,6 +578,11 @@ main(int argc, char **argv)
 	}
 
 	config_apply_transport_defaults(&cfg, upstream_is_hostname);
+
+	resolver_set_tls_config(cfg.tls_ca_file, cfg.tls_auth_name,
+	                        cfg.tls_insecure);
+	if (cfg.resolver_discovery)
+		discover_resolver_metadata(&cfg);
 
 	/*
 	 * DoH implies TLS upstream and requires a hostname (Host header).

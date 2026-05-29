@@ -10,7 +10,9 @@
 #include <netinet/in.h>
 
 enum {
-	DNS_UPSTREAM_MAX_ADDRS = 4,
+	DNS_UPSTREAM_MAX_ADDRS         = 4,
+	DNS_EDNS_PADDING_DEFAULT_BLOCK = 128,
+	DNS_EDNS_PADDING_MAX_BLOCK     = 512,
 };
 
 enum dns_listen_mode {
@@ -32,6 +34,10 @@ struct dns_config {
 	bool                 upstream_tls;       /* forward to upstream over DoT */
 	bool                 upstream_doh;       /* forward upstream over DoH (RFC 8484) */
 	char                 doh_path[128];      /* DoH URL path (default /dns-query) */
+	bool                 edns_padding;       /* pad encrypted upstream queries */
+	uint16_t             edns_padding_block; /* RFC 8467-style block size */
+	bool                 resolver_discovery; /* opt-in SVCB/DDR metadata query */
+	char                 resolver_discovery_name[256];
 	char                 tls_cert[256];      /* PEM cert for DoT listener */
 	char                 tls_key[256];       /* PEM key for DoT listener */
 	char                 tls_ca_file[256];   /* PEM CA bundle for upstream verify */
@@ -43,6 +49,8 @@ int
 config_load(const char *path, struct dns_config *cfg);
 int
 config_parse_port_u16(const char *value, uint16_t *out);
+int
+config_parse_edns_padding_block(const char *value, uint16_t *out);
 int
 config_parse_listen_mode(const char *value, enum dns_listen_mode *out);
 enum dns_listen_mode

@@ -68,15 +68,46 @@ append_question(uint8_t *buf, size_t pos, const char *qname, uint16_t qtype)
 }
 
 static size_t
-append_rr_header(uint8_t *buf, size_t pos, const char *name, uint16_t type,
-                 uint32_t ttl, uint16_t rdlen)
+append_rr_header_class(uint8_t *buf, size_t pos, const char *name,
+                       uint16_t type, uint16_t rrclass, uint32_t ttl,
+                       uint16_t rdlen)
 {
 	pos = append_name(buf, pos, name);
 	write_u16(buf + pos, type);
-	write_u16(buf + pos + 2, DNS_CLASS_IN);
+	write_u16(buf + pos + 2, rrclass);
 	write_u32(buf + pos + 4, ttl);
 	write_u16(buf + pos + 8, rdlen);
 	return pos + 10;
+}
+
+static size_t
+append_rr_header(uint8_t *buf, size_t pos, const char *name, uint16_t type,
+                 uint32_t ttl, uint16_t rdlen)
+{
+	return append_rr_header_class(buf, pos, name, type, DNS_CLASS_IN, ttl,
+	                              rdlen);
+}
+
+static size_t
+append_svcparam(uint8_t *buf, size_t pos, uint16_t key,
+                const uint8_t *value, uint16_t len)
+{
+	write_u16(buf + pos, key);
+	write_u16(buf + pos + 2, len);
+	pos += 4;
+	memcpy(buf + pos, value, len);
+	return pos + len;
+}
+
+static size_t
+append_edns_option(uint8_t *buf, size_t pos, uint16_t code,
+                   const uint8_t *value, uint16_t len)
+{
+	write_u16(buf + pos, code);
+	write_u16(buf + pos + 2, len);
+	pos += 4;
+	memcpy(buf + pos, value, len);
+	return pos + len;
 }
 
 static int
@@ -115,6 +146,24 @@ test_type_from_str_known(void)
 	TEST_EXPECT_INT_EQ(v, DNS_TYPE_MX);
 	TEST_EXPECT_INT_EQ(dns_type_from_str("DNSKEY", &v), 0);
 	TEST_EXPECT_INT_EQ(v, DNS_TYPE_DNSKEY);
+	TEST_EXPECT_INT_EQ(dns_type_from_str("SSHFP", &v), 0);
+	TEST_EXPECT_INT_EQ(v, DNS_TYPE_SSHFP);
+	TEST_EXPECT_INT_EQ(dns_type_from_str("NSEC3", &v), 0);
+	TEST_EXPECT_INT_EQ(v, DNS_TYPE_NSEC3);
+	TEST_EXPECT_INT_EQ(dns_type_from_str("NSEC3PARAM", &v), 0);
+	TEST_EXPECT_INT_EQ(v, DNS_TYPE_NSEC3PARAM);
+	TEST_EXPECT_INT_EQ(dns_type_from_str("TLSA", &v), 0);
+	TEST_EXPECT_INT_EQ(v, DNS_TYPE_TLSA);
+	TEST_EXPECT_INT_EQ(dns_type_from_str("CDS", &v), 0);
+	TEST_EXPECT_INT_EQ(v, DNS_TYPE_CDS);
+	TEST_EXPECT_INT_EQ(dns_type_from_str("CDNSKEY", &v), 0);
+	TEST_EXPECT_INT_EQ(v, DNS_TYPE_CDNSKEY);
+	TEST_EXPECT_INT_EQ(dns_type_from_str("ZONEMD", &v), 0);
+	TEST_EXPECT_INT_EQ(v, DNS_TYPE_ZONEMD);
+	TEST_EXPECT_INT_EQ(dns_type_from_str("SVCB", &v), 0);
+	TEST_EXPECT_INT_EQ(v, DNS_TYPE_SVCB);
+	TEST_EXPECT_INT_EQ(dns_type_from_str("https", &v), 0);
+	TEST_EXPECT_INT_EQ(v, DNS_TYPE_HTTPS);
 }
 
 static void
@@ -281,6 +330,252 @@ test_print_soa_record(void)
 }
 
 static void
+test_print_https_record_with_svcparams(void)
+{
+	uint8_t buf[DNS_MAX_MSG_SIZE];
+	char    out[4096];
+	size_t  pos = make_response_header(buf, 7,
+	                                   DNS_FLAG_QR | DNS_FLAG_RD | DNS_FLAG_RA,
+	                                   1, 1, 0, 0);
+
+	pos         = append_question(buf, pos, "example.com", DNS_TYPE_HTTPS);
+
+	uint8_t rdata[512];
+	size_t  rdlen = 0;
+	write_u16(rdata + rdlen, 1);
+	rdlen += 2;
+	rdlen  = append_name(rdata, rdlen, "svc.example.com");
+
+	uint8_t mandatory[4];
+	write_u16(mandatory, 1);     /* alpn */
+	write_u16(mandatory + 2, 3); /* port */
+	rdlen          = append_svcparam(rdata, rdlen, 0, mandatory,
+	                                 (uint16_t)sizeof(mandatory));
+
+	uint8_t alpn[] = { 2, 'h', '2', 2, 'h', '3' };
+	rdlen          = append_svcparam(rdata, rdlen, 1, alpn,
+	                                 (uint16_t)sizeof(alpn));
+
+	uint8_t port[2];
+	write_u16(port, 8443);
+	rdlen                = append_svcparam(rdata, rdlen, 3, port,
+	                                       (uint16_t)sizeof(port));
+
+	uint8_t ipv4hint[]   = { 192, 0, 2, 1, 198, 51, 100, 2 };
+	rdlen                = append_svcparam(rdata, rdlen, 4, ipv4hint,
+	                                       (uint16_t)sizeof(ipv4hint));
+
+	uint8_t ech[]        = { 0x00, 0x11, 0x22 };
+	rdlen                = append_svcparam(rdata, rdlen, 5, ech,
+	                                       (uint16_t)sizeof(ech));
+
+	uint8_t ipv6hint[16] = {
+		0x20,
+		0x01,
+		0x0d,
+		0xb8,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		1,
+	};
+	rdlen               = append_svcparam(rdata, rdlen, 6, ipv6hint,
+	                                      (uint16_t)sizeof(ipv6hint));
+
+	const char *dohpath = "/dns-query{?dns}";
+	rdlen               = append_svcparam(rdata, rdlen, 7, (const uint8_t *)dohpath,
+	                                      (uint16_t)strlen(dohpath));
+
+	uint8_t unknown[]   = { 0xaa, 0xbb };
+	rdlen               = append_svcparam(rdata, rdlen, 65400, unknown,
+	                                      (uint16_t)sizeof(unknown));
+
+	pos                 = append_rr_header(buf, pos, "example.com", DNS_TYPE_HTTPS, 300,
+	                                       (uint16_t)rdlen);
+	memcpy(buf + pos, rdata, rdlen);
+	pos += rdlen;
+
+	print_to_buffer(buf, pos, out, sizeof(out));
+	TEST_CHECK(contains(out, "HTTPS"));
+	TEST_CHECK(contains(out, "1 svc.example.com"));
+	TEST_CHECK(contains(out, "mandatory=alpn,port"));
+	TEST_CHECK(contains(out, "alpn=h2,h3"));
+	TEST_CHECK(contains(out, "port=8443"));
+	TEST_CHECK(contains(out, "ipv4hint=192.0.2.1,198.51.100.2"));
+	TEST_CHECK(contains(out, "ech=001122"));
+	TEST_CHECK(contains(out, "ipv6hint=2001:db8::1"));
+	TEST_CHECK(contains(out, "dohpath=\"/dns-query{?dns}\""));
+	TEST_CHECK(contains(out, "key65400=aabb"));
+}
+
+static void
+test_print_svcb_no_default_alpn_and_bad_params(void)
+{
+	uint8_t buf[DNS_MAX_MSG_SIZE];
+	char    out[4096];
+	size_t  pos = make_response_header(buf, 10,
+	                                   DNS_FLAG_QR | DNS_FLAG_RD | DNS_FLAG_RA,
+	                                   1, 1, 0, 0);
+
+	pos         = append_question(buf, pos, "svc.example.com", DNS_TYPE_SVCB);
+
+	uint8_t rdata[256];
+	size_t  rdlen = 0;
+	write_u16(rdata + rdlen, 1);
+	rdlen                   += 2;
+	rdlen                    = append_name(rdata, rdlen, "svc.example.com");
+
+	uint8_t empty            = 0;
+	rdlen                    = append_svcparam(rdata, rdlen, 2, &empty, 0);
+
+	uint8_t bad_alpn[]       = { 3, 'h' };
+	rdlen                    = append_svcparam(rdata, rdlen, 1, bad_alpn,
+	                                           (uint16_t)sizeof(bad_alpn));
+
+	uint8_t bad_port[]       = { 0x23 };
+	rdlen                    = append_svcparam(rdata, rdlen, 3, bad_port,
+	                                           (uint16_t)sizeof(bad_port));
+
+	uint8_t bad_mandatory[]  = { 0x00 };
+	rdlen                    = append_svcparam(rdata, rdlen, 0, bad_mandatory,
+	                                           (uint16_t)sizeof(bad_mandatory));
+
+	pos                      = append_rr_header(buf, pos, "svc.example.com", DNS_TYPE_SVCB,
+	                                            300, (uint16_t)rdlen);
+	memcpy(buf + pos, rdata, rdlen);
+	pos += rdlen;
+
+	print_to_buffer(buf, pos, out, sizeof(out));
+	TEST_CHECK(contains(out, "SVCB"));
+	TEST_CHECK(contains(out, "1 svc.example.com"));
+	TEST_CHECK(contains(out, "no-default-alpn"));
+	TEST_CHECK(contains(out, "alpn=<bad>"));
+	TEST_CHECK(contains(out, "port=<bad len 1>"));
+	TEST_CHECK(contains(out, "mandatory=<bad>"));
+}
+
+static void
+test_print_https_truncated_svcparam_header(void)
+{
+	uint8_t buf[DNS_MAX_MSG_SIZE];
+	char    out[4096];
+	size_t  pos = make_response_header(buf, 11,
+	                                   DNS_FLAG_QR | DNS_FLAG_RD | DNS_FLAG_RA,
+	                                   1, 1, 0, 0);
+
+	pos         = append_question(buf, pos, "bad.example.com", DNS_TYPE_HTTPS);
+
+	uint8_t rdata[256];
+	size_t  rdlen = 0;
+	write_u16(rdata + rdlen, 1);
+	rdlen += 2;
+	rdlen  = append_name(rdata, rdlen, "svc.example.com");
+	write_u16(rdata + rdlen, 3);
+	rdlen += 2;
+
+	pos    = append_rr_header(buf, pos, "bad.example.com", DNS_TYPE_HTTPS,
+	                          300, (uint16_t)rdlen);
+	memcpy(buf + pos, rdata, rdlen);
+	pos += rdlen;
+
+	print_to_buffer(buf, pos, out, sizeof(out));
+	TEST_CHECK(contains(out, "HTTPS"));
+	TEST_CHECK(contains(out, "<bad HTTPS param>"));
+}
+
+static void
+test_print_tlsa_and_zonemd_records(void)
+{
+	uint8_t buf[DNS_MAX_MSG_SIZE];
+	char    out[4096];
+	size_t  pos    = make_response_header(buf, 8,
+	                                      DNS_FLAG_QR | DNS_FLAG_RD | DNS_FLAG_RA,
+	                                      1, 2, 0, 0);
+
+	pos            = append_question(buf, pos, "_443._tcp.example.com",
+	                                 DNS_TYPE_TLSA);
+
+	uint8_t tlsa[] = { 3, 1, 1, 0xde, 0xad, 0xbe, 0xef };
+	pos            = append_rr_header(buf, pos, "_443._tcp.example.com", DNS_TYPE_TLSA,
+	                                  300, (uint16_t)sizeof(tlsa));
+	memcpy(buf + pos, tlsa, sizeof(tlsa));
+	pos += sizeof(tlsa);
+
+	uint8_t zonemd[10];
+	write_u32(zonemd, 2026010101);
+	zonemd[4] = 1; /* simple */
+	zonemd[5] = 1; /* sha384 */
+	zonemd[6] = 1;
+	zonemd[7] = 2;
+	zonemd[8] = 3;
+	zonemd[9] = 4;
+	pos       = append_rr_header(buf, pos, "example.com", DNS_TYPE_ZONEMD, 3600,
+	                             (uint16_t)sizeof(zonemd));
+	memcpy(buf + pos, zonemd, sizeof(zonemd));
+	pos += sizeof(zonemd);
+
+	print_to_buffer(buf, pos, out, sizeof(out));
+	TEST_CHECK(contains(out, "TLSA"));
+	TEST_CHECK(contains(out, "usage=3 selector=1 matching=1 data=deadbeef"));
+	TEST_CHECK(contains(out, "ZONEMD"));
+	TEST_CHECK(contains(out, "serial=2026010101"));
+	TEST_CHECK(contains(out, "scheme=1(simple)"));
+	TEST_CHECK(contains(out, "hash=1(sha384)"));
+	TEST_CHECK(contains(out, "digest=01020304"));
+}
+
+static void
+test_print_opt_edns_options(void)
+{
+	uint8_t buf[DNS_MAX_MSG_SIZE];
+	char    out[4096];
+	size_t  pos = make_response_header(buf, 9,
+	                                   DNS_FLAG_QR | DNS_FLAG_RD | DNS_FLAG_RA,
+	                                   1, 0, 0, 1);
+
+	pos         = append_question(buf, pos, "example.com", DNS_TYPE_A);
+
+	uint8_t opt_rdata[128];
+	size_t  opt_len    = 0;
+
+	uint8_t ecs[]      = { 0x00, 0x01, 24, 0, 203, 0, 113 };
+	opt_len            = append_edns_option(opt_rdata, opt_len, DNS_EDNS_OPTION_ECS,
+	                                        ecs, (uint16_t)sizeof(ecs));
+
+	uint8_t padding[4] = { 0 };
+	opt_len            = append_edns_option(opt_rdata, opt_len,
+	                                        DNS_EDNS_OPTION_PADDING, padding,
+	                                        (uint16_t)sizeof(padding));
+
+	uint8_t ede[8];
+	write_u16(ede, 15);
+	memcpy(ede + 2, "policy", 6);
+	opt_len = append_edns_option(opt_rdata, opt_len, DNS_EDNS_OPTION_EDE,
+	                             ede, (uint16_t)sizeof(ede));
+
+	pos     = append_rr_header_class(buf, pos, "", DNS_TYPE_OPT, 1232,
+	                                 0x00008000U, (uint16_t)opt_len);
+	memcpy(buf + pos, opt_rdata, opt_len);
+	pos += opt_len;
+
+	print_to_buffer(buf, pos, out, sizeof(out));
+	TEST_CHECK(contains(out, ";; OPT udp_size=1232"));
+	TEST_CHECK(contains(out, "version=0"));
+	TEST_CHECK(contains(out, "flags=0x8000"));
+	TEST_CHECK(contains(out, "EDNS option ECS family=1 source=24 scope=0 address=203.0.113.0"));
+	TEST_CHECK(contains(out, "EDNS option Padding len=4"));
+	TEST_CHECK(contains(out, "EDNS option EDE code=15 (Blocked) text=\"policy\""));
+}
+
+static void
 test_print_nxdomain_status(void)
 {
 	uint8_t buf[DNS_MAX_MSG_SIZE];
@@ -340,6 +635,11 @@ main(void)
 	test_print_mx_record();
 	test_print_txt_record();
 	test_print_soa_record();
+	test_print_https_record_with_svcparams();
+	test_print_svcb_no_default_alpn_and_bad_params();
+	test_print_https_truncated_svcparam_header();
+	test_print_tlsa_and_zonemd_records();
+	test_print_opt_edns_options();
 	test_print_nxdomain_status();
 	test_print_unknown_type_hex();
 	test_print_rejects_short_buffer();

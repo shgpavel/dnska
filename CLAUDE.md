@@ -5,10 +5,10 @@ This file provides guidance to Claude Code when working in this repository.
 ## Project Overview
 
 **dnska** is a DNS forwarder with an in-memory response cache, DNS over TLS
-(DoT), and DNS over HTTPS (DoH) upstream support. It listens on IPv4 and IPv6
-UDP and TCP sockets (plain listener mode) or DoT sockets, parses DNS queries,
-forwards cache misses to a single upstream DNS server, and returns raw DNS
-responses to the client.
+(DoT), DNS over HTTPS (DoH), EDNS privacy options, and DNSSEC foundation
+parsing. It listens on IPv4 and IPv6 UDP and TCP sockets (plain listener mode)
+or DoT sockets, parses DNS queries, forwards cache misses to a single upstream
+DNS server, and returns raw DNS responses to the client.
 
 Current scope:
 
@@ -19,9 +19,12 @@ Current scope:
   upstream SERVFAIL responses, IPv4 and IPv6 upstream support, hostname
   resolution for upstreams with automatic DoT mode, ephemeral self-signed cert
   generation for the DoT listener, SNI on outbound TLS connections, upstream
-  certificate verification controls
-- Not implemented yet: DNSSEC validation, persistent cache, DoH server
-  listener, upstream connection pooling
+  certificate verification controls, serve-stale fallback with EDE 3, EDNS
+  padding for encrypted upstreams, opt-in resolver SVCB discovery, SVCB/HTTPS,
+  TLSA, ZONEMD, NSEC3, and EDNS option printing, DNSSEC parsing/analysis
+  foundation
+- Not implemented yet: full DNSSEC chain validation, persistent cache, DoH
+  server listener, DoQ/ODoH transports, upstream connection pooling
 
 The `refs/` directory contains reference implementations used for study:
 
@@ -58,24 +61,27 @@ Startup flow:
    and the upstream port defaults to `853` unless set explicitly
 5. DoH upstream implies TLS upstream and defaults the upstream port to `443`
    unless set explicitly
-6. The effective listener mode is resolved from `listen_mode`: `auto` keeps
+6. Optional resolver SVCB discovery can query `_dns.<resolver-name>` metadata
+   after bootstrap resolution and refine DoT/DoH port/path settings
+7. The effective listener mode is resolved from `listen_mode`: `auto` keeps
    legacy behavior (DoT upstream -> DoT listener, otherwise plain), while
    `plain` and `dot` override only the inbound listener
-7. If no explicit listen port was given, the listen port defaults to `853`
+8. If no explicit listen port was given, the listen port defaults to `853`
    for an effective DoT listener and `53` for a plain listener
-8. `server_init()` creates the thread pool and cache, then binds either DoT
+9. `server_init()` creates the thread pool and cache, then binds either DoT
    sockets (TLS TCP) or plain sockets (UDP + TCP) on the listen port; for DoT,
    a self-signed P-256 cert is generated in memory unless `--tls-cert`/
    `--tls-key` paths are provided
-9. `server_run()` enters a `poll()` loop over up to 4 fds
+10. `server_run()` enters a `poll()` loop over up to 4 fds
    (IPv4/IPv6 × UDP + TCP in plain mode, or IPv4/IPv6 × DoT in TLS mode)
 
 Config file support:
 
 - Section: `[dns]`
 - Keys: `upstream`, `port`/`listen_port`, `listen_mode`, `upstream_port`,
-  `upstream_tls`, `upstream_doh`, `doh_path`, `tls_cert`, `tls_key`,
-  `tls_ca_file`, `tls_auth_name`, `tls_insecure`
+  `upstream_tls`, `upstream_doh`, `doh_path`, `edns_padding`,
+  `edns_padding_block`, `resolver_discovery`, `resolver_discovery_name`,
+  `tls_cert`, `tls_key`, `tls_ca_file`, `tls_auth_name`, `tls_insecure`
 - `#` and `;` comments are accepted
 
 CLI flags:
@@ -85,6 +91,10 @@ CLI flags:
   of upstream transport
 - `-t/--upstream-tls` — force DoT upstream when using a literal IP
 - `--upstream-doh`, `--doh-path` — force DoH upstream and optional URL path
+- `--edns-padding`, `--edns-padding-block` — pad encrypted upstream DNS
+  messages; default block is 128 bytes and max is 512
+- `--resolver-discovery`, `--resolver-discovery-name` — opt into
+  `_dns.<name>` SVCB metadata discovery for resolver ALPN/port/path hints
 - `-k/--tls-key`, `--tls-cert` (long only) — custom PEM cert/key for the
   DoT listener (optional; an ephemeral self-signed cert is used if omitted)
 - `--tls-ca`, `--tls-auth-name`, `--insecure` — upstream TLS verification
@@ -121,7 +131,8 @@ The code is split across these modules under `src/`:
 | `dns.c` | `include/dns.h` | DNS wire parsing, name decoding, cacheability checks, response/query matching |
 | `cache.c` | `include/cache.h` | Fixed-size LRU cache for DNS responses |
 | `server.c` | `include/server.h` | UDP/TCP/DoT listeners, query worker pool, cache lookup/insert path |
-| `resolver.c` | `include/resolver.h` | UDP forwarding with TCP fallback on TC; DoT forwarding via `forward_tls()` |
+| `resolver.c` | `include/resolver.h` | UDP forwarding with TCP fallback on TC; DoT/DoH forwarding; EDNS padding; resolver SVCB discovery |
+| `dnssec.c` | `include/dnssec.h` | DNSSEC metadata parsing, DS digest checks, response analysis states |
 | `random.c` | `include/random.h` | Cryptographic random bytes via `getrandom`/`/dev/urandom` |
 | `wire.c` | `include/wire.h` | Low-level DNS wire helpers: `wire_read_u16/u32`, `wire_skip_name` |
 
@@ -165,6 +176,9 @@ TTL behavior:
 - Negative responses use the SOA negative TTL, i.e. `min(SOA TTL, SOA MINIMUM)`
 - Cached upstream `SERVFAIL` responses use `CACHE_SERVFAIL_TTL` which is
   currently `5` seconds
+- Expired positive and negative entries remain available for
+  `CACHE_STALE_WINDOW_SEC` and may be served with `CACHE_STALE_ANSWER_TTL`
+  plus EDE 3 when upstream forwarding fails
 - Cache hits decrement TTLs before sending the response
 - When the cache lifetime is shorter than the wire TTLs, returned TTLs are
   clamped so clients do not cache failures longer than intended
@@ -206,7 +220,11 @@ Resolver behavior:
   `tls_auth_name` is configured
 - DoH (`upstream_doh = true`): sends HTTP/1.1 POST requests with
   `application/dns-message` bodies over TLS
-- On upstream failure the server synthesizes a SERVFAIL response
+- EDNS padding is applied only for encrypted upstream transports when enabled
+- Resolver SVCB discovery parses advisory `alpn`, `port`, and `dohpath`
+  metadata; DoQ/ODoH ALPNs are recorded but not used as transports yet
+- On upstream failure the server prefers a stale cached answer when eligible,
+  otherwise it synthesizes a SERVFAIL response
 
 DoT listener behavior:
 
@@ -241,8 +259,11 @@ separate binary under `build/test/`:
 | Binary | Source | Covers |
 |--------|--------|--------|
 | `cache_test` | `test/cache/cache_test.c` | NXDOMAIN/SERVFAIL TTL clamping, mixed-case QNAME rewrite |
+| `config_test` | `test/config/config_test.c` | Config parser, transport defaults, EDNS padding and discovery flags |
 | `dns_test` | `test/dns/dns_test.c` | DNS wire parsing, name decoding, cacheability checks |
-| `resolver_test` | `test/resolver/resolver_test.c` | Upstream UDP forwarding, 0x20 randomization, TCP fallback |
+| `dnssec_test` | `test/dnssec/dnssec_test.c` | DNSSEC RR parsing, DS digest matching, validation state analysis |
+| `print_test` | `test/print/print_test.c` | Dig-style output, modern RR and EDNS option formatting |
+| `resolver_test` | `test/resolver/resolver_test.c` | Upstream UDP forwarding, 0x20 randomization, TCP fallback, EDNS padding, SVCB discovery |
 | `server_test` | `test/server/server_test.c` | End-to-end server request handling, plain and DoT modes |
 
 Run all tests with:

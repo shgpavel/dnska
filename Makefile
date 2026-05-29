@@ -14,7 +14,7 @@ BINDIR     ?= $(PREFIX)/bin
 SYSCONFDIR ?= /etc
 DOCDIR     ?= $(PREFIX)/share/doc/dnska
 
-SRCS    = $(SRCDIR)/main.c $(SRCDIR)/cache.c $(SRCDIR)/config.c $(SRCDIR)/dns.c $(SRCDIR)/log.c $(SRCDIR)/print.c $(SRCDIR)/random.c $(SRCDIR)/server.c $(SRCDIR)/resolver.c $(SRCDIR)/wire.c
+SRCS    = $(SRCDIR)/main.c $(SRCDIR)/cache.c $(SRCDIR)/config.c $(SRCDIR)/dns.c $(SRCDIR)/dnssec.c $(SRCDIR)/log.c $(SRCDIR)/print.c $(SRCDIR)/random.c $(SRCDIR)/server.c $(SRCDIR)/resolver.c $(SRCDIR)/wire.c
 OBJS    = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
 HDRS    = $(wildcard $(SRCDIR)/include/*.h)
 TEST_SRCS = $(wildcard $(TESTDIR)/*/*_test.c)
@@ -53,6 +53,10 @@ $(TESTOBJDIR)/dns_test: $(TESTDIR)/dns/dns_test.c $(SRCDIR)/dns.c $(SRCDIR)/wire
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/dns/dns_test.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c
 
+$(TESTOBJDIR)/dnssec_test: $(TESTDIR)/dnssec/dnssec_test.c $(SRCDIR)/dnssec.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/dnssec/dnssec_test.c $(SRCDIR)/dnssec.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c
+
 $(TESTOBJDIR)/print_test: $(TESTDIR)/print/print_test.c $(SRCDIR)/print.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c $(HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/print/print_test.c $(SRCDIR)/print.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c
@@ -63,12 +67,12 @@ $(TESTOBJDIR)/resolver_test: $(TESTDIR)/resolver/resolver_test.c $(SRCDIR)/resol
 
 $(TESTOBJDIR)/server_test: $(TESTDIR)/server/server_test.c \
     $(SRCDIR)/server.c $(SRCDIR)/cache.c $(SRCDIR)/config.c \
-    $(SRCDIR)/dns.c $(SRCDIR)/log.c $(SRCDIR)/random.c \
+    $(SRCDIR)/dns.c $(SRCDIR)/dnssec.c $(SRCDIR)/log.c $(SRCDIR)/random.c \
     $(SRCDIR)/resolver.c $(SRCDIR)/wire.c $(HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TESTDIR)/server/server_test.c \
 	    $(SRCDIR)/server.c $(SRCDIR)/cache.c $(SRCDIR)/config.c \
-	    $(SRCDIR)/dns.c $(SRCDIR)/log.c $(SRCDIR)/random.c \
+	    $(SRCDIR)/dns.c $(SRCDIR)/dnssec.c $(SRCDIR)/log.c $(SRCDIR)/random.c \
 	    $(SRCDIR)/resolver.c $(SRCDIR)/wire.c
 
 $(TESTOBJDIR)/dns_perf: $(TESTDIR)/perf/dns_perf.c $(SRCDIR)/dns.c $(SRCDIR)/wire.c $(HDRS)

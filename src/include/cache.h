@@ -17,6 +17,8 @@ enum {
 	CACHE_BUCKETS            = 1024,
 	CACHE_NEGATIVE_FLOOR_TTL = 30,
 	CACHE_SERVFAIL_TTL       = 5, /* TTL for upstream SERVFAIL responses */
+	CACHE_STALE_WINDOW_SEC   = 3600,
+	CACHE_STALE_ANSWER_TTL   = 30,
 };
 
 struct cache_entry {
@@ -61,13 +63,27 @@ cache_lru_tail_name(struct cache *c, char *buf, size_t buf_size);
 /*
  * Returns 1 on hit (response copied into buf with the caller's question bytes,
  * plus patched ID and TTLs),
- * 0 on miss, -1 if buf is too small, -2 if entry was expired and evicted.
+ * 0 on miss, -1 if buf is too small, -2 if entry is expired.
+ * Expired entries remain available to cache_lookup_stale() until the stale
+ * window elapses.
  */
 int
 cache_lookup(struct cache *c, const char *name, uint16_t qtype, uint16_t qclass,
              const struct dns_query_cache_key *query_key, uint16_t id,
              const uint8_t *question, size_t question_len,
              uint8_t *buf, size_t buf_size, size_t *len);
+
+/*
+ * Returns a stale positive or negative response when the matching entry is
+ * expired but still within CACHE_STALE_WINDOW_SEC.  TTLs are rewritten to
+ * CACHE_STALE_ANSWER_TTL.  Return values otherwise match cache_lookup().
+ */
+int
+cache_lookup_stale(struct cache *c, const char *name, uint16_t qtype,
+                   uint16_t                          qclass,
+                   const struct dns_query_cache_key *query_key, uint16_t id,
+                   const uint8_t *question, size_t question_len,
+                   uint8_t *buf, size_t buf_size, size_t *len);
 
 /*
  * If ttl_override is non-zero it is used directly; otherwise the minimum TTL

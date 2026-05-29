@@ -21,6 +21,7 @@
 
 #include "cache.h"
 #include "dns.h"
+#include "dnssec.h"
 #include "log.h"
 #include "random.h"
 #include "resolver.h"
@@ -28,7 +29,11 @@
 #include "wire.h"
 
 /* RFC 7766 §6.4: servers SHOULD implement an idle timeout >= 10 seconds */
-enum { TCP_IDLE_TIMEOUT_SEC = 10 };
+enum {
+	TCP_IDLE_TIMEOUT_SEC = 10,
+	DNS_EDE_STALE_ANSWER = 3,
+	DNS_EDE_STALE_LEN    = 6,
+};
 
 static void
 addr_str(const struct sockaddr_storage *addr, char *buf, size_t len,
@@ -164,6 +169,75 @@ make_badvers_response(const uint8_t *query, size_t query_len,
 	resp[p++] = 0x00; /* RDLEN high */
 	resp[p++] = 0x00; /* RDLEN low */
 
+	return p;
+}
+
+static size_t
+append_stale_answer_ede(uint8_t *resp, size_t resp_len, size_t resp_size,
+                        const struct dns_query_cache_key *key)
+{
+	static const uint8_t ede_stale[DNS_EDE_STALE_LEN] = {
+		0x00,
+		DNS_EDNS_OPTION_EDE,
+		0x00,
+		0x02,
+		0x00,
+		DNS_EDE_STALE_ANSWER,
+	};
+	size_t opt_off;
+	size_t opt_total;
+	int    opt_rc;
+
+	if (resp_len + DNS_EDE_STALE_LEN > resp_size)
+		return 0;
+
+	opt_rc = dns_find_opt(resp, resp_len, &opt_off, &opt_total);
+	if (opt_rc < 0)
+		return 0;
+
+	if (opt_rc == 0) {
+		int n = wire_skip_name(resp, resp_len, opt_off);
+		if (n < 0)
+			return 0;
+
+		size_t fixed_off = opt_off + (size_t)n;
+		if (fixed_off + 10 > resp_len || opt_off + opt_total > resp_len)
+			return 0;
+
+		size_t   rdlen_off = fixed_off + 8;
+		uint16_t rdlen     = wire_read_u16(resp + rdlen_off);
+		if (rdlen > UINT16_MAX - DNS_EDE_STALE_LEN)
+			return 0;
+
+		size_t ede_off = opt_off + opt_total;
+		memmove(resp + ede_off + DNS_EDE_STALE_LEN,
+		        resp + ede_off, resp_len - ede_off);
+		memcpy(resp + ede_off, ede_stale, sizeof(ede_stale));
+		wire_write_u16(resp + rdlen_off,
+		               (uint16_t)(rdlen + DNS_EDE_STALE_LEN));
+		return resp_len + DNS_EDE_STALE_LEN;
+	}
+
+	if (wire_read_u16(resp + 10) == UINT16_MAX
+	    || resp_len + 11 + DNS_EDE_STALE_LEN > resp_size)
+		return 0;
+
+	size_t p          = resp_len;
+	resp[p++]         = 0x00;
+	resp[p++]         = 0x00;
+	resp[p++]         = DNS_TYPE_OPT;
+	uint16_t udp_size = key != NULL && key->opt_udp_size != 0 ? key->opt_udp_size : 512;
+	resp[p++]         = (uint8_t)(udp_size >> 8);
+	resp[p++]         = (uint8_t)udp_size;
+	resp[p++]         = 0x00;
+	resp[p++]         = 0x00;
+	resp[p++]         = 0x00;
+	resp[p++]         = 0x00;
+	resp[p++]         = 0x00;
+	resp[p++]         = DNS_EDE_STALE_LEN;
+	memcpy(resp + p, ede_stale, sizeof(ede_stale));
+	p += sizeof(ede_stale);
+	wire_write_u16(resp + 10, (uint16_t)(wire_read_u16(resp + 10) + 1));
 	return p;
 }
 
@@ -493,6 +567,72 @@ send_response(struct query_task *task, const uint8_t *response,
 	return 0;
 }
 
+static bool
+try_build_stale_response(struct query_task *task, const struct dns_message *msg,
+                         uint16_t query_id, uint8_t *response,
+                         size_t response_size, size_t *response_len)
+{
+	char qtype_buf[32];
+	int  stale = cache_lookup_stale(&task->srv->cache,
+	                                msg->question.name,
+	                                msg->question.qtype,
+	                                msg->question.qclass,
+	                                &msg->cache_key,
+	                                query_id,
+	                                task->query + DNS_HEADER_SIZE,
+	                                msg->question_wire_len,
+	                                response, response_size,
+	                                response_len);
+
+	if (stale == -1) {
+		log_msg(LOG_WARN,
+		        "cache: failed to build stale response for %s %s\n",
+		        msg->question.name,
+		        dns_type_str(msg->question.qtype, qtype_buf,
+		                     sizeof(qtype_buf)));
+		return false;
+	}
+	if (stale != 1)
+		return false;
+
+	if (msg->has_edns) {
+		size_t ede_len = append_stale_answer_ede(response, *response_len,
+		                                         response_size,
+		                                         &msg->cache_key);
+		if (ede_len != 0)
+			*response_len = ede_len;
+	}
+
+	log_msg(LOG_INFO, "cache: serving stale %s %s (%zu bytes)\n",
+	        msg->question.name,
+	        dns_type_str(msg->question.qtype, qtype_buf, sizeof(qtype_buf)),
+	        *response_len);
+	return true;
+}
+
+static enum dnssec_validation_state
+annotate_dnssec_response(uint8_t *response, size_t response_len,
+                         struct dnssec_validation_result *result,
+                         bool                            *ad_cleared)
+{
+	if (ad_cleared != NULL)
+		*ad_cleared = false;
+
+	if (dnssec_analyze_message(response, response_len, result) != DNSSEC_OK)
+		result->state = DNSSEC_VALIDATION_BOGUS;
+
+	if (response_len >= 4 && result->state != DNSSEC_VALIDATION_SECURE) {
+		uint16_t flags = wire_read_u16(response + 2);
+		if ((flags & DNS_FLAG_AD) != 0) {
+			wire_write_u16(response + 2, flags & (uint16_t)~DNS_FLAG_AD);
+			if (ad_cleared != NULL)
+				*ad_cleared = true;
+		}
+	}
+
+	return result->state;
+}
+
 /*
  * Process the DNS query already in task->query[0..task->query_len-1].
  * Sends the response via conn_fd (TCP) or sock_fd (UDP).
@@ -573,10 +713,15 @@ process_dns_query(struct query_task *task)
 	        dns_type_str(msg.question.qtype, qtype_buf, sizeof(qtype_buf)),
 	        addr_buf, port);
 
-	uint8_t  response[DNS_MAX_MSG_SIZE];
-	size_t   response_len = 0;
-	uint16_t query_id     = msg.header.id;
-	int      hit          = 0;
+	uint8_t                         response[DNS_MAX_MSG_SIZE];
+	size_t                          response_len  = 0;
+	uint16_t                        query_id      = msg.header.id;
+	int                             hit           = 0;
+	struct dnssec_validation_result dnssec_result = {
+		.state = DNSSEC_VALIDATION_UNCHECKED,
+	};
+	bool dnssec_known      = false;
+	bool dnssec_ad_cleared = false;
 
 	if (dns_query_is_cacheable(&msg))
 		hit = cache_lookup(&task->srv->cache,
@@ -613,6 +758,9 @@ process_dns_query(struct query_task *task)
 		                          task->srv->config.upstream_doh,
 		                          task->srv->config.doh_path,
 		                          task->srv->config.upstream_hostname,
+		                          task->srv->config.edns_padding ?
+		                                  task->srv->config.edns_padding_block :
+		                                  0,
 		                          task->query, task->query_len,
 		                          response, sizeof(response),
 		                          &response_len);
@@ -621,7 +769,18 @@ process_dns_query(struct query_task *task)
 			uint16_t udp_size = msg.has_edns ? (msg.cache_key.opt_udp_size > 0 ? msg.cache_key.opt_udp_size : 512) : 0;
 			log_msg(LOG_WARN,
 			        "server: upstream failed for %s, "
-			        "sending SERVFAIL\n",
+			        "checking stale cache\n",
+			        msg.question.name);
+
+			if (dns_query_is_cacheable(&msg)
+			    && try_build_stale_response(task, &msg, query_id,
+			                                response,
+			                                sizeof(response),
+			                                &response_len))
+				goto have_response;
+
+			log_msg(LOG_WARN,
+			        "server: no stale answer for %s, sending SERVFAIL\n",
 			        msg.question.name);
 
 			response_len = make_error_response(
@@ -633,16 +792,35 @@ process_dns_query(struct query_task *task)
 			if (response_len == 0)
 				return 0;
 		} else {
-			uint16_t rcode = response_len >= 4 ? (response[3] & DNS_FLAGS_RCODE_MASK) : 0;
-			log_msg(LOG_INFO, "reply: %s %s -> %s (%zu bytes)\n",
+			uint16_t                     rcode        = response_len >= 4 ? (response[3] & DNS_FLAGS_RCODE_MASK) : 0;
+			enum dnssec_validation_state dnssec_state = annotate_dnssec_response(response, response_len,
+			                                                                     &dnssec_result,
+			                                                                     &dnssec_ad_cleared);
+			dnssec_known                              = true;
+
+			log_msg(LOG_INFO,
+			        "reply: %s %s -> %s (%zu bytes, dnssec=%s%s)\n",
 			        msg.question.name,
 			        dns_type_str(msg.question.qtype, qtype_buf,
 			                     sizeof(qtype_buf)),
 			        dns_rcode_str(rcode, rcode_buf, sizeof(rcode_buf)),
-			        response_len);
+			        response_len,
+			        dnssec_validation_state_str(dnssec_state),
+			        dnssec_ad_cleared ? ", cleared-ad" : "");
 
 			uint16_t flags     = wire_read_u16(response + 2);
 			uint32_t cache_ttl = (rcode == DNS_RCODE_SERVFAIL) ? CACHE_SERVFAIL_TTL : 0;
+
+			if (rcode == DNS_RCODE_SERVFAIL
+			    && dns_query_is_cacheable(&msg)
+			    && try_build_stale_response(task, &msg, query_id,
+			                                response,
+			                                sizeof(response),
+			                                &response_len)) {
+				dnssec_known      = false;
+				dnssec_ad_cleared = false;
+				goto have_response;
+			}
 
 			if (dns_query_is_cacheable(&msg)
 			    && (flags & DNS_FLAG_TC) == 0
@@ -677,6 +855,23 @@ process_dns_query(struct query_task *task)
 				                     qtype_buf, sizeof(qtype_buf)));
 			}
 		}
+	}
+
+have_response:
+	if (!dnssec_known) {
+		enum dnssec_validation_state dnssec_state = annotate_dnssec_response(response, response_len,
+		                                                                     &dnssec_result,
+		                                                                     &dnssec_ad_cleared);
+		dnssec_known                              = true;
+		log_msg(LOG_DEBUG,
+		        "dnssec: %s %s state=%s records=%u malformed=%u%s\n",
+		        msg.question.name,
+		        dns_type_str(msg.question.qtype, qtype_buf,
+		                     sizeof(qtype_buf)),
+		        dnssec_validation_state_str(dnssec_state),
+		        dnssec_result.dnssec_records,
+		        dnssec_result.malformed_dnssec_records,
+		        dnssec_ad_cleared ? " cleared-ad" : "");
 	}
 
 	/* For TCP clients, the full response is always usable (RFC 7766

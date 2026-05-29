@@ -26,10 +26,16 @@
 #include "wire.h"
 
 enum {
-	RESOLVER_MIN_SOURCE_PORT   = 1024,
-	RESOLVER_BIND_RETRIES      = 64,
-	RESOLVER_TIMEOUT_SEC       = 3,
-	RESOLVER_ID_MISMATCH_LIMIT = 3,
+	RESOLVER_MIN_SOURCE_PORT      = 1024,
+	RESOLVER_BIND_RETRIES         = 64,
+	RESOLVER_TIMEOUT_SEC          = 3,
+	RESOLVER_ID_MISMATCH_LIMIT    = 3,
+	RESOLVER_DNS_TYPE_SVCB        = 64,
+	RESOLVER_EDNS_OPTION_PADDING  = 12,
+	RESOLVER_SVCB_PARAM_MANDATORY = 0,
+	RESOLVER_SVCB_PARAM_ALPN      = 1,
+	RESOLVER_SVCB_PARAM_PORT      = 3,
+	RESOLVER_SVCB_PARAM_DOH_PATH  = 7,
 };
 
 static SSL_CTX       *client_tls_ctx;
@@ -691,11 +697,449 @@ forward_tcp(const struct sockaddr *upstream, socklen_t upstream_len,
 	return 0;
 }
 
+static size_t
+remove_edns_padding(uint8_t *buf, size_t len, size_t opt_off)
+{
+	int n = wire_skip_name(buf, len, opt_off);
+	if (n < 0)
+		return 0;
+
+	size_t fixed_off = opt_off + (size_t)n;
+	if (fixed_off + 10 > len)
+		return 0;
+
+	size_t   rdlen_off = fixed_off + 8;
+	size_t   rdata_off = fixed_off + 10;
+	uint16_t rdlen     = wire_read_u16(buf + rdlen_off);
+	size_t   rdata_end = rdata_off + rdlen;
+	size_t   read_pos  = rdata_off;
+	size_t   write_pos = rdata_off;
+
+	if (rdata_end > len)
+		return 0;
+
+	while (read_pos < rdata_end) {
+		if (rdata_end - read_pos < 4)
+			return 0;
+
+		uint16_t opt_code = wire_read_u16(buf + read_pos);
+		uint16_t opt_len  = wire_read_u16(buf + read_pos + 2);
+		size_t   opt_size = (size_t)opt_len + 4;
+
+		if (rdata_end - read_pos < opt_size)
+			return 0;
+
+		if (opt_code != RESOLVER_EDNS_OPTION_PADDING) {
+			if (write_pos != read_pos)
+				memmove(buf + write_pos, buf + read_pos,
+				        opt_size);
+			write_pos += opt_size;
+		}
+
+		read_pos += opt_size;
+	}
+
+	size_t kept_len = write_pos - rdata_off;
+	size_t removed  = (size_t)rdlen - kept_len;
+	if (removed == 0)
+		return len;
+
+	memmove(buf + write_pos, buf + rdata_end, len - rdata_end);
+	wire_write_u16(buf + rdlen_off, (uint16_t)kept_len);
+	return len - removed;
+}
+
+static size_t
+add_edns_padding(uint8_t *buf, size_t len, size_t max_size,
+                 uint16_t block_size)
+{
+	if (block_size == 0)
+		return len;
+
+	size_t opt_off   = 0;
+	size_t opt_total = 0;
+	int    rc        = dns_find_opt(buf, len, &opt_off, &opt_total);
+
+	if (rc != 0)
+		return 0;
+
+	len = remove_edns_padding(buf, len, opt_off);
+	if (len == 0)
+		return 0;
+
+	rc = dns_find_opt(buf, len, &opt_off, &opt_total);
+	if (rc != 0)
+		return 0;
+
+	size_t rem = len % block_size;
+	if (rem == 0)
+		return len;
+
+	size_t option_size = (size_t)block_size - rem;
+	if (option_size < 4)
+		option_size += block_size;
+	if (option_size > UINT16_MAX || len + option_size > max_size)
+		return 0;
+
+	int n = wire_skip_name(buf, len, opt_off);
+	if (n < 0)
+		return 0;
+
+	size_t fixed_off = opt_off + (size_t)n;
+	if (fixed_off + 10 > len)
+		return 0;
+
+	size_t   rdlen_off = fixed_off + 8;
+	size_t   rdata_off = fixed_off + 10;
+	uint16_t rdlen     = wire_read_u16(buf + rdlen_off);
+	size_t   insert    = rdata_off + rdlen;
+
+	if (insert > len || (size_t)rdlen + option_size > UINT16_MAX)
+		return 0;
+
+	memmove(buf + insert + option_size, buf + insert, len - insert);
+	wire_write_u16(buf + insert, RESOLVER_EDNS_OPTION_PADDING);
+	wire_write_u16(buf + insert + 2, (uint16_t)(option_size - 4));
+	memset(buf + insert + 4, 0, option_size - 4);
+	wire_write_u16(buf + rdlen_off, (uint16_t)(rdlen + option_size));
+
+	return len + option_size;
+}
+
+static int
+build_discovery_qname(const char *resolver_name, char *out, size_t out_size)
+{
+	size_t name_len;
+	int    n;
+
+	if (resolver_name == NULL || resolver_name[0] == '\0')
+		return -1;
+
+	name_len = strlen(resolver_name);
+	while (name_len > 0 && resolver_name[name_len - 1] == '.')
+		name_len--;
+	if (name_len == 0)
+		return -1;
+	if (name_len > DNS_MAX_NAME_LEN)
+		return -1;
+
+	if (name_len >= 5
+	    && strncasecmp(resolver_name, "_dns.", 5) == 0) {
+		n = snprintf(out, out_size, "%.*s", (int)name_len,
+		             resolver_name);
+	} else {
+		n = snprintf(out, out_size, "_dns.%.*s", (int)name_len,
+		             resolver_name);
+	}
+	if (n < 0 || (size_t)n >= out_size)
+		return -1;
+
+	return 0;
+}
+
+static size_t
+append_wire_name(uint8_t *buf, size_t pos, size_t buf_size,
+                 const char *name)
+{
+	const char *label = name;
+
+	if (name[0] == '.' && name[1] == '\0') {
+		if (pos + 1 > buf_size)
+			return 0;
+		buf[pos++] = 0;
+		return pos;
+	}
+
+	while (*label != '\0') {
+		const char *dot = strchr(label, '.');
+		size_t      len = dot != NULL ? (size_t)(dot - label) :
+		                                strlen(label);
+
+		if (len == 0 || len > DNS_MAX_LABEL_LEN)
+			return 0;
+		if (pos + 1 + len > buf_size)
+			return 0;
+
+		buf[pos++] = (uint8_t)len;
+		memcpy(buf + pos, label, len);
+		pos += len;
+
+		if (dot == NULL)
+			break;
+		label = dot + 1;
+	}
+
+	if (pos + 1 > buf_size)
+		return 0;
+	buf[pos++] = 0;
+	return pos;
+}
+
+static size_t
+build_svcb_query(uint8_t *buf, size_t buf_size, uint16_t id,
+                 const char *qname)
+{
+	if (buf_size < DNS_HEADER_SIZE)
+		return 0;
+
+	memset(buf, 0, DNS_HEADER_SIZE);
+	wire_write_u16(buf, id);
+	wire_write_u16(buf + 2, DNS_FLAG_RD);
+	wire_write_u16(buf + 4, 1);
+
+	size_t pos = append_wire_name(buf, DNS_HEADER_SIZE, buf_size,
+	                              qname);
+	if (pos == 0 || pos + 4 > buf_size)
+		return 0;
+
+	wire_write_u16(buf + pos, RESOLVER_DNS_TYPE_SVCB);
+	wire_write_u16(buf + pos + 2, DNS_CLASS_IN);
+	return pos + 4;
+}
+
+static bool
+svcb_mandatory_key_supported(uint16_t key)
+{
+	switch (key) {
+	case RESOLVER_SVCB_PARAM_MANDATORY:
+	case RESOLVER_SVCB_PARAM_ALPN:
+	case 2: /* no-default-alpn */
+	case RESOLVER_SVCB_PARAM_PORT:
+	case 4: /* ipv4hint */
+	case 6: /* ipv6hint */
+	case RESOLVER_SVCB_PARAM_DOH_PATH:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool
+parse_svcb_mandatory(const uint8_t *value, size_t len)
+{
+	if ((len % 2) != 0)
+		return false;
+
+	for (size_t pos = 0; pos < len; pos += 2) {
+		if (!svcb_mandatory_key_supported(wire_read_u16(value + pos)))
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+alpn_equals(const uint8_t *value, size_t len, const char *alpn)
+{
+	size_t alpn_len = strlen(alpn);
+
+	return len == alpn_len && memcmp(value, alpn, len) == 0;
+}
+
+static bool
+parse_svcb_alpn(struct resolver_discovery_result *candidate,
+                const uint8_t *value, size_t len)
+{
+	size_t pos = 0;
+
+	if (len == 0)
+		return false;
+
+	while (pos < len) {
+		uint8_t alpn_len = value[pos++];
+
+		if (alpn_len == 0 || pos + alpn_len > len)
+			return false;
+
+		if (alpn_equals(value + pos, alpn_len, "dot"))
+			candidate->supports_dot = true;
+		else if (alpn_equals(value + pos, alpn_len, "h2")
+		         || alpn_equals(value + pos, alpn_len, "h3")
+		         || alpn_equals(value + pos, alpn_len, "http/1.1"))
+			candidate->supports_doh = true;
+		else if (alpn_equals(value + pos, alpn_len, "doq"))
+			candidate->supports_doq = true;
+		else if (alpn_equals(value + pos, alpn_len, "odoh"))
+			candidate->supports_odoh = true;
+
+		pos += alpn_len;
+	}
+
+	return true;
+}
+
+static bool
+copy_doh_path(char *out, size_t out_size, const uint8_t *value, size_t len)
+{
+	size_t copy_len = 0;
+
+	if (len == 0 || value[0] != '/')
+		return false;
+
+	while (copy_len < len && value[copy_len] != '{') {
+		if (value[copy_len] == '\0'
+		    || value[copy_len] == ' '
+		    || value[copy_len] == '\t'
+		    || value[copy_len] == '\r'
+		    || value[copy_len] == '\n')
+			return false;
+		copy_len++;
+	}
+
+	if (copy_len == 0 || copy_len >= out_size)
+		return false;
+
+	memcpy(out, value, copy_len);
+	out[copy_len] = '\0';
+	return true;
+}
+
+static bool
+parse_svcb_rdata(const uint8_t *msg, size_t msg_len,
+                 size_t rdata_off, uint16_t rdlen,
+                 struct resolver_discovery_result *candidate)
+{
+	size_t rdata_end;
+	size_t target_len = 0;
+	size_t pos;
+	bool   have_alpn = false;
+
+	if (rdlen < 3)
+		return false;
+	if (rdata_off + rdlen > msg_len)
+		return false;
+
+	memset(candidate, 0, sizeof(*candidate));
+	candidate->priority = wire_read_u16(msg + rdata_off);
+	if (candidate->priority == 0)
+		return false; /* AliasMode needs another query; leave fallback. */
+
+	pos       = rdata_off + 2;
+	rdata_end = rdata_off + rdlen;
+	if (dns_parse_name(msg, msg_len, pos, candidate->target_name,
+	                   sizeof(candidate->target_name), &target_len)
+	    < 0)
+		return false;
+	pos += target_len;
+	if (pos > rdata_end)
+		return false;
+
+	while (pos < rdata_end) {
+		if (rdata_end - pos < 4)
+			return false;
+
+		uint16_t key       = wire_read_u16(msg + pos);
+		uint16_t value_len = wire_read_u16(msg + pos + 2);
+		size_t   value_off = pos + 4;
+
+		if (value_off + value_len > rdata_end)
+			return false;
+
+		switch (key) {
+		case RESOLVER_SVCB_PARAM_MANDATORY:
+			if (!parse_svcb_mandatory(msg + value_off, value_len))
+				return false;
+			break;
+		case RESOLVER_SVCB_PARAM_ALPN:
+			have_alpn = true;
+			if (!parse_svcb_alpn(candidate, msg + value_off,
+			                     value_len))
+				return false;
+			break;
+		case RESOLVER_SVCB_PARAM_PORT:
+			if (value_len != 2)
+				return false;
+			candidate->port = wire_read_u16(msg + value_off);
+			break;
+		case RESOLVER_SVCB_PARAM_DOH_PATH:
+			if (!copy_doh_path(candidate->doh_path,
+			                   sizeof(candidate->doh_path),
+			                   msg + value_off, value_len))
+				candidate->doh_path[0] = '\0';
+			break;
+		default:
+			break;
+		}
+
+		pos = value_off + value_len;
+	}
+
+	if (!have_alpn)
+		return false;
+	if (candidate->supports_doh && candidate->doh_path[0] == '\0')
+		candidate->supports_doh = false;
+
+	candidate->found = candidate->supports_dot || candidate->supports_doh || candidate->supports_doq || candidate->supports_odoh;
+	return candidate->found;
+}
+
+static int
+parse_svcb_response(const uint8_t *response, size_t response_len,
+                    struct resolver_discovery_result *result)
+{
+	struct resolver_discovery_result best;
+	uint16_t                         qdcount;
+	uint16_t                         ancount;
+	size_t                           pos = DNS_HEADER_SIZE;
+
+	if (response_len < DNS_HEADER_SIZE)
+		return -1;
+
+	memset(&best, 0, sizeof(best));
+	qdcount = wire_read_u16(response + 4);
+	ancount = wire_read_u16(response + 6);
+
+	for (uint16_t i = 0; i < qdcount; i++) {
+		int n = wire_skip_name(response, response_len, pos);
+		if (n < 0)
+			return -1;
+		pos += (size_t)n + 4;
+		if (pos > response_len)
+			return -1;
+	}
+
+	for (uint16_t i = 0; i < ancount; i++) {
+		int n = wire_skip_name(response, response_len, pos);
+		if (n < 0)
+			return -1;
+		pos += (size_t)n;
+		if (pos + 10 > response_len)
+			return -1;
+
+		uint16_t type      = wire_read_u16(response + pos);
+		uint16_t rrclass   = wire_read_u16(response + pos + 2);
+		uint16_t rdlen     = wire_read_u16(response + pos + 8);
+		size_t   rdata_off = pos + 10;
+		size_t   next      = rdata_off + rdlen;
+
+		if (next > response_len)
+			return -1;
+
+		if (type == RESOLVER_DNS_TYPE_SVCB
+		    && rrclass == DNS_CLASS_IN) {
+			struct resolver_discovery_result candidate;
+
+			if (parse_svcb_rdata(response, response_len,
+			                     rdata_off, rdlen,
+			                     &candidate)
+			    && (!best.found
+			        || candidate.priority < best.priority))
+				best = candidate;
+		}
+
+		pos = next;
+	}
+
+	*result = best;
+	return 0;
+}
+
 static int
 forward_one_address(const char *upstream_addr, uint16_t upstream_port,
                     bool upstream_tls, bool upstream_doh,
                     const char    *doh_path,
                     const char    *upstream_hostname,
+                    uint16_t       edns_padding_block,
                     const uint8_t *query, size_t query_len,
                     uint8_t *response, size_t response_size,
                     size_t *response_len)
@@ -749,7 +1193,19 @@ forward_one_address(const char *upstream_addr, uint16_t upstream_port,
 		fprintf(stderr, "resolver: failed to set outbound EDNS\n");
 		return -1;
 	}
-	query_len               = forwarded_len;
+	query_len = forwarded_len;
+
+	if ((upstream_tls || upstream_doh) && edns_padding_block != 0) {
+		size_t padded_len = add_edns_padding(
+		        forwarded_query, query_len, sizeof(forwarded_query),
+		        edns_padding_block);
+		if (padded_len == 0) {
+			fprintf(stderr,
+			        "resolver: failed to add EDNS padding\n");
+			return -1;
+		}
+		query_len = padded_len;
+	}
 
 	struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
 	struct sockaddr_in  *a4 = (struct sockaddr_in *)&ss;
@@ -916,6 +1372,7 @@ resolver_forward(const char upstream_addrs[][INET6_ADDRSTRLEN],
                  uint16_t upstream_port, bool upstream_tls,
                  bool upstream_doh, const char *doh_path,
                  const char    *upstream_hostname,
+                 uint16_t       edns_padding_block,
                  const uint8_t *query, size_t query_len,
                  uint8_t *response, size_t response_size,
                  size_t *response_len)
@@ -929,6 +1386,7 @@ resolver_forward(const char upstream_addrs[][INET6_ADDRSTRLEN],
 		int rc = forward_one_address(upstream_addrs[i], upstream_port,
 		                             upstream_tls, upstream_doh,
 		                             doh_path, upstream_hostname,
+		                             edns_padding_block,
 		                             query, query_len,
 		                             response, response_size,
 		                             response_len);
@@ -941,4 +1399,52 @@ resolver_forward(const char upstream_addrs[][INET6_ADDRSTRLEN],
 	}
 
 	return -1;
+}
+
+int
+resolver_discover_svcb(const char upstream_addrs[][INET6_ADDRSTRLEN],
+                       size_t     upstream_addr_count,
+                       uint16_t upstream_port, bool upstream_tls,
+                       bool upstream_doh, const char *doh_path,
+                       const char                       *upstream_hostname,
+                       uint16_t                          edns_padding_block,
+                       const char                       *resolver_name,
+                       struct resolver_discovery_result *result)
+{
+	char     qname[DNS_MAX_NAME_LEN + 1];
+	uint8_t  query[DNS_MAX_MSG_SIZE];
+	uint8_t  response[DNS_MAX_MSG_SIZE];
+	uint16_t id = 0;
+	size_t   query_len;
+	size_t   response_len = 0;
+
+	if (result == NULL)
+		return -1;
+	memset(result, 0, sizeof(*result));
+
+	if (build_discovery_qname(resolver_name, qname, sizeof(qname)) < 0)
+		return -1;
+	if (random_bytes(&id, sizeof(id)) < 0)
+		return -1;
+
+	query_len = build_svcb_query(query, sizeof(query), id, qname);
+	if (query_len == 0)
+		return -1;
+
+	if (resolver_forward(upstream_addrs, upstream_addr_count,
+	                     upstream_port, upstream_tls, upstream_doh,
+	                     doh_path, upstream_hostname,
+	                     edns_padding_block,
+	                     query, query_len,
+	                     response, sizeof(response),
+	                     &response_len)
+	    < 0)
+		return -1;
+
+	if (response_len < DNS_HEADER_SIZE)
+		return -1;
+	if ((response[3] & DNS_FLAGS_RCODE_MASK) != DNS_RCODE_OK)
+		return 0;
+
+	return parse_svcb_response(response, response_len, result);
 }
